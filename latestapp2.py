@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import html
+import json
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -21,6 +23,7 @@ from numbers import Number
 from pathlib import Path
 import re
 from typing import Any
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -56,6 +59,7 @@ DEFAULT_MIN_CASH_THRESHOLD: float = 500_000.0   # ₹5 lakh minimum cash floor
 DEFAULT_TDS_RATE: float = 0.0                    # TDS % on gross collections
 DEFAULT_OD_LIMIT: float = 0.0                    # Sanctioned OD / CC limit
 DEFAULT_OD_RATE_PA: float = 12.0                 # OD interest rate % p.a.
+DEFAULT_OPENING_OD_UTILIZATION: float = 0.0      # OD outstanding brought forward
 
 # ── Holiday calendar ──────────────────────────────────────────────────────────
 STATE_BANK_HOLIDAYS: dict[str, dict[int, dict[str, str]]] = {
@@ -159,15 +163,13 @@ STATE_BANK_HOLIDAYS: dict[str, dict[int, dict[str, str]]] = {
 }
 
 TOTAL_ROWS: set[str] = {
-    "Opening Balance",
-    "Collections",
+    "Inflows",
     "Total Inflows",
     "Cash Outflows",
     "Total Outflows",
     "Net Movement of Cash",
-    "Ending Cash Balance (Planned)",
-    "Ending Cash Balance (Actual)",
-    "Unexpected Spends / Savings",
+    "Opening Balance incl. OD Opening O/S",
+    "Closing Balance",
 }
 
 PREFERRED_OUTFLOW_ORDER: list[str] = [
@@ -178,8 +180,62 @@ PREFERRED_OUTFLOW_ORDER: list[str] = [
     "Vendor Payment",
     "Reimbursements",   # Fixed: was "Reimbursments"
 ]
+DEFAULT_RECEIVABLE_EXPORT_COLUMNS: list[str] = [
+    "Date",
+    "Ref. No.",
+    "Clients",
+    "Pending Amt",
+    "Ageing",
+    "Tentative Collection Date",
+    "Due date",
+    "Billing Type",
+]
+DEFAULT_OUTFLOW_EXPORT_COLUMNS: list[str] = [
+    "Payment Date",
+    "Description",
+    "Amount",
+    "Party Name",
+]
+INFLOW_SHEET_NAME_HINTS: tuple[str, ...] = (
+    "receivable",
+    "inflow",
+    "receipt",
+    "receipts",
+    "collection",
+    "collections",
+    "customeradvance",
+    "advancefromcustomer",
+    "advancereceived",
+    "clientreceipt",
+)
+OUTFLOW_SHEET_NAME_HINTS: tuple[str, ...] = (
+    "payment",
+    "payments",
+    "payable",
+    "expense",
+    "expenses",
+    "vendor",
+    "salary",
+    "salaries",
+    "dues",
+    "reimbursement",
+    "reimbursements",
+    "advancevendor",
+    "vendoradvance",
+)
 
 CELL_REF_PATTERN = re.compile(r"\$?([A-Z]{1,3})\$?(\d+)")
+WEEKLY_DRILLDOWN_QUERY_KEYS = (
+    "weekly_drill_scope",
+    "weekly_drill_week",
+    "weekly_drill_line",
+)
+VIEW_QUERY_KEY = "cashflow_view"
+FORECAST_MONTH_QUERY_KEY = "forecast_month"
+BALANCE_DATE_QUERY_KEY = "balance_as_of"
+DEFAULT_NAV_VIEW = "Executive Summary"
+GROUP_CASHFLOW_VIEW = "Group Cashflow"
+UPLOAD_CACHE_DIR = Path(__file__).with_name(".cashflow_upload_cache")
 
 ALLOWED_AST_BINARY_OPERATORS: tuple[type[ast.operator], ...] = (
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
@@ -205,10 +261,26 @@ def order_outflow_sheets(sheet_names: list[str]) -> list[str]:
     )
 
 
+def order_sheet_names(sheet_names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for sheet_name in sheet_names:
+        key = standardize_label(sheet_name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(str(sheet_name))
+    return ordered
+
+
 def find_column(columns: list[str], options: list[str]) -> str | None:
     normalized = {col: standardize_label(col) for col in columns}
-    for option in options:
-        target = standardize_label(option)
+    targets = [standardize_label(option) for option in options if standardize_label(option)]
+    for target in targets:
+        for col, label in normalized.items():
+            if label == target:
+                return col
+    for target in targets:
         for col, label in normalized.items():
             if target and target in label:
                 return col
@@ -235,6 +307,70 @@ def build_summary_label(
             values = df[column].fillna("").astype(str).str.strip()
             label = label.mask(label.eq(""), values)
     return label.mask(label.eq(""), default_value)
+
+
+def detect_receivables_columns(columns: list[str]) -> dict[str, str | None]:
+    return {
+        "date": find_column(columns, ["invoice date", "collection date", "receipt date", "actual date", "date"]),
+        "amount": find_column(columns, ["net receipt", "receipt amount", "pending amt", "gross amt", "basic amt", "amount"]),
+        "client": find_column(columns, ["clients", "customer", "client", "party name", "party", "counterparty", "particulars", "particualrs"]),
+        "reference": find_column(columns, ["ref no", "invoice no", "invoice number", "inv number"]),
+        "ageing": find_column(columns, ["ageing", "aging"]),
+        "tentative_date": find_column(columns, ["tentative collection date", "tentative date", "expected collection date"]),
+        "due_date": find_column(columns, ["due date"]),
+        "billing_type": find_column(columns, ["billing type"]),
+    }
+
+
+def detect_outflow_columns(columns: list[str]) -> dict[str, str | None]:
+    return {
+        "planned_date": find_column(columns, ["payment date", "plan payment date", "date", "invoice date"]),
+        "actual_date": find_column(columns, ["actual date"]),
+        "amount": find_column(columns, ["payable", "amount", "balance", "gross", "net amount", "net payable"]),
+        "vendor": find_column(columns, ["vendors name as per tally", "vendor name", "vendor", "supplier", "payee", "party name", "party"]),
+        "description": find_column(
+            columns,
+            ["description", "expense", "nature of payment", "particulars", "particualrs", "invoice no", "inv. number", "inv number"],
+        ),
+    }
+
+
+def classify_sheet_schema(sheet_name: str, df: pd.DataFrame) -> dict[str, Any]:
+    columns = list(df.columns)
+    receivables_map = detect_receivables_columns(columns)
+    outflow_map = detect_outflow_columns(columns)
+    normalized_sheet_name = standardize_label(sheet_name)
+    receivables_signals = sum(
+        1 for key in ["client", "reference", "ageing", "tentative_date", "due_date", "billing_type"]
+        if receivables_map.get(key)
+    )
+    outflow_signals = sum(1 for key in ["vendor", "description", "actual_date"] if outflow_map.get(key))
+    has_receivables_name = any(hint in normalized_sheet_name for hint in INFLOW_SHEET_NAME_HINTS)
+    has_outflow_name = any(hint in normalized_sheet_name for hint in OUTFLOW_SHEET_NAME_HINTS)
+    receivables_date_col = receivables_map.get("tentative_date") or receivables_map.get("due_date") or receivables_map.get("date")
+    outflow_date_col = outflow_map.get("planned_date") or outflow_map.get("actual_date")
+    inflow_amount_present = bool(receivables_map.get("amount"))
+    outflow_amount_present = bool(outflow_map.get("amount"))
+    looks_like_receivables = inflow_amount_present and bool(receivables_date_col)
+    looks_like_outflow = outflow_amount_present and bool(outflow_date_col)
+    strong_receivables = has_receivables_name or (receivables_signals >= 2 and not has_outflow_name)
+    strong_outflow = has_outflow_name or bool(outflow_map.get("vendor") or outflow_map.get("description")) or (
+        outflow_signals >= 1 and not has_receivables_name
+    )
+
+    if looks_like_receivables and strong_receivables and not strong_outflow:
+        return {"role": "receivables", "column_map": receivables_map, "columns": columns}
+    if looks_like_outflow and strong_outflow and not strong_receivables:
+        return {"role": "outflow", "column_map": outflow_map, "columns": columns}
+
+    # For user-added operational tabs, default any date+amount sheet to outflow
+    # unless it has strong receivable-style signals.
+    if looks_like_outflow and not strong_receivables:
+        return {"role": "outflow", "column_map": outflow_map, "columns": columns}
+    if looks_like_receivables:
+        return {"role": "receivables", "column_map": receivables_map, "columns": columns}
+
+    return {"role": "ignored", "column_map": {}, "columns": columns}
 
 
 def reset_source_pointer(source: Any) -> None:
@@ -273,7 +409,11 @@ def short_date_label(value: pd.Timestamp) -> str:
 
 
 def full_date_with_day(value: pd.Timestamp) -> str:
-    return format_date(value)
+    return pd.Timestamp(value).strftime("%a %d %b %Y")
+
+
+def compact_day_date_label(value: pd.Timestamp) -> str:
+    return pd.Timestamp(value).strftime("%a %d %b")
 
 
 def format_date_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -294,11 +434,179 @@ def format_date_columns(df: pd.DataFrame) -> pd.DataFrame:
     return display_df
 
 
+def get_query_params() -> dict[str, str]:
+    query_params_api = getattr(st, "query_params", None)
+    if query_params_api is not None:
+        try:
+            return {
+                key: values[-1] if isinstance(values, list) else str(values)
+                for key, values in query_params_api.items()
+            }
+        except Exception:
+            pass
+    getter = getattr(st, "experimental_get_query_params", None)
+    if callable(getter):
+        raw_params = getter()
+        return {
+            key: values[-1] if isinstance(values, list) else str(values)
+            for key, values in raw_params.items()
+        }
+    return {}
+
+
+def set_query_params(params: dict[str, str]) -> None:
+    query_params_api = getattr(st, "query_params", None)
+    if query_params_api is not None:
+        try:
+            query_params_api.clear()
+            for key, value in params.items():
+                query_params_api[key] = value
+            return
+        except Exception:
+            pass
+    setter = getattr(st, "experimental_set_query_params", None)
+    if callable(setter):
+        setter(**params)
+
+
+def clear_weekly_drilldown_query_params() -> None:
+    params = get_query_params()
+    for key in WEEKLY_DRILLDOWN_QUERY_KEYS:
+        params.pop(key, None)
+    set_query_params(params)
+
+
+def sync_forecast_month_query_param(selected_month: pd.Timestamp) -> None:
+    params = get_query_params()
+    selected_value = build_month_start(selected_month).strftime("%Y-%m")
+    if params.get(FORECAST_MONTH_QUERY_KEY) == selected_value:
+        return
+    params[FORECAST_MONTH_QUERY_KEY] = selected_value
+    set_query_params(params)
+
+
+def build_weekly_drilldown_href(
+    scope: str,
+    week_key: str,
+    line_item: str,
+    selected_month: pd.Timestamp,
+    balance_as_of_date: pd.Timestamp,
+) -> str:
+    params = get_query_params()
+    for key in WEEKLY_DRILLDOWN_QUERY_KEYS:
+        params.pop(key, None)
+    params.update({
+        "weekly_drill_scope": scope,
+        "weekly_drill_week": week_key,
+        "weekly_drill_line": line_item,
+        VIEW_QUERY_KEY: GROUP_CASHFLOW_VIEW,
+        FORECAST_MONTH_QUERY_KEY: build_month_start(selected_month).strftime("%Y-%m"),
+        BALANCE_DATE_QUERY_KEY: pd.Timestamp(balance_as_of_date).strftime("%Y-%m-%d"),
+    })
+    return f"?{urlencode(params)}#weekly-drilldown-target"
+
+
+def has_weekly_drilldown_query() -> bool:
+    params = get_query_params()
+    return all(params.get(key) for key in WEEKLY_DRILLDOWN_QUERY_KEYS)
+
+
+def get_requested_view(default_view: str = DEFAULT_NAV_VIEW) -> str:
+    params = get_query_params()
+    requested_view = params.get(VIEW_QUERY_KEY, "").strip()
+    return requested_view or default_view
+
+
+def upload_cache_path(kind: str, suffix: str) -> Path:
+    UPLOAD_CACHE_DIR.mkdir(exist_ok=True)
+    return UPLOAD_CACHE_DIR / f"{kind}{suffix}"
+
+
+def build_named_bytes_io(payload: bytes, name: str) -> BytesIO:
+    buffer = BytesIO(payload)
+    buffer.name = name
+    return buffer
+
+
+def persist_uploaded_file(kind: str, uploaded: Any, load_time: str | None = None) -> None:
+    binary_path = upload_cache_path(kind, ".bin")
+    meta_path = upload_cache_path(kind, ".json")
+    if uploaded is None:
+        if binary_path.exists():
+            binary_path.unlink()
+        if meta_path.exists():
+            meta_path.unlink()
+        return
+
+    reset_source_pointer(uploaded)
+    payload = uploaded.read()
+    reset_source_pointer(uploaded)
+    binary_path.write_bytes(payload)
+    meta_path.write_text(
+        json.dumps({
+            "name": getattr(uploaded, "name", f"{kind}.xlsx"),
+            "load_time": load_time,
+        }),
+        encoding="utf-8",
+    )
+
+
+def load_cached_upload(kind: str) -> tuple[BytesIO | None, dict[str, Any]]:
+    binary_path = upload_cache_path(kind, ".bin")
+    meta_path = upload_cache_path(kind, ".json")
+    if not binary_path.exists():
+        return None, {}
+    meta: dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    buffer = build_named_bytes_io(
+        binary_path.read_bytes(),
+        meta.get("name", f"{kind}.xlsx"),
+    )
+    return buffer, meta
+
+
 def normalize_billing_bucket(value: Any) -> str:
     label = str(value or "").strip().lower()
     if "adv" in label:
         return "Advance"
-    return "Arrear"
+    return "Receivables"
+
+
+def classify_weekly_drilldown_line_item(
+    line_item: str,
+    outflow_categories: list[str],
+) -> dict[str, str] | None:
+    if line_item == "Total Inflows":
+        return {"section": "inflows", "mode": "all", "label": "Collections"}
+    if line_item == "   Advance":
+        return {"section": "inflows", "mode": "advance", "label": "Advance Collections"}
+    if line_item == "   Receivables":
+        return {"section": "inflows", "mode": "receivables", "label": "Receivables"}
+    if line_item == "      Due Within Week":
+        return {"section": "inflows", "mode": "due_within_week", "label": "Due Within Week"}
+    if line_item == "      Overdue":
+        return {"section": "inflows", "mode": "overdue", "label": "Overdue"}
+    if line_item == "Total Outflows":
+        return {"section": "outflows", "mode": "all", "label": "Total Outflows"}
+    category_name = line_item.strip()
+    normalized_categories = {
+        standardize_label(category): str(category)
+        for category in outflow_categories
+        if str(category).strip()
+    }
+    matched_category = normalized_categories.get(standardize_label(category_name))
+    if matched_category:
+        return {
+            "section": "outflows",
+            "mode": "category",
+            "category": matched_category,
+            "label": matched_category,
+        }
+    return None
 
 
 def file_md5(source: Any) -> str:
@@ -310,6 +618,288 @@ def file_md5(source: Any) -> str:
         return digest
     except Exception:
         return "N/A"
+
+
+EDIT_HISTORY_CONFIG: dict[str, dict[str, Any]] = {
+    "receivables": {
+        "label": "Inflows",
+        "line_label": "receivable line",
+        "key_columns": ["counterparty", "invoice_date", "due_date"],
+        "detail_columns": ["amount", "tentative_collection_date", "ageing", "aging_bucket", "billing_bucket"],
+    },
+    "outflows": {
+        "label": "Outflows",
+        "line_label": "outflow entry",
+        "key_columns": ["sheet_name", "vendor_name", "date"],
+        "detail_columns": ["amount", "description"],
+    },
+}
+
+
+def _edit_state_key(dataset_key: str) -> str:
+    return f"edited_{dataset_key}"
+
+
+def _edit_history_key(dataset_key: str) -> str:
+    return f"_edit_history_{dataset_key}"
+
+
+def _edit_history_index_key(dataset_key: str) -> str:
+    return f"_edit_history_{dataset_key}_index"
+
+
+def _edit_history_log_key(dataset_key: str) -> str:
+    return f"_edit_history_{dataset_key}_log"
+
+
+def _normalize_history_scalar(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value).strftime("%Y-%m-%d")
+    if isinstance(value, Number):
+        return round(float(value), 2)
+    return str(value).strip()
+
+
+def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    for column in normalized.columns:
+        if pd.api.types.is_datetime64_any_dtype(normalized[column]):
+            normalized[column] = (
+                pd.to_datetime(normalized[column], errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+                .fillna("")
+            )
+        else:
+            normalized[column] = normalized[column].map(_normalize_history_scalar)
+    return normalized.fillna("")
+
+
+def _build_history_index(df: pd.DataFrame, dataset_key: str) -> pd.DataFrame:
+    normalized = _normalize_history_df(df)
+    if normalized.empty:
+        normalized["_history_key"] = pd.Series(dtype="object")
+        return normalized.set_index("_history_key")
+    config = EDIT_HISTORY_CONFIG[dataset_key]
+    key_columns = [column for column in config["key_columns"] if column in normalized.columns]
+    if not key_columns:
+        key_columns = normalized.columns.tolist()
+    base_key = normalized[key_columns].astype(str).agg(" | ".join, axis=1).replace("", "<blank>")
+    sequence = base_key.groupby(base_key, sort=False).cumcount().astype(str)
+    normalized["_history_key"] = base_key + " #" + sequence
+    return normalized.set_index("_history_key", drop=True)
+
+
+def edit_frames_equal(left_df: pd.DataFrame, right_df: pd.DataFrame) -> bool:
+    all_columns = sorted(set(left_df.columns).union(right_df.columns))
+    left_normalized = _normalize_history_df(left_df.reindex(columns=all_columns))
+    right_normalized = _normalize_history_df(right_df.reindex(columns=all_columns))
+    return left_normalized.equals(right_normalized)
+
+
+def _format_history_field_name(field_name: str) -> str:
+    return field_name.replace("_", " ").title()
+
+
+def _format_history_value(field_name: str, value: Any) -> str:
+    if value in ("", None):
+        return "blank"
+    if field_name == "amount":
+        try:
+            return f"Rs {format_currency(float(value))}"
+        except Exception:
+            return str(value)
+    if "date" in field_name:
+        try:
+            return pd.Timestamp(value).strftime(DATE_DISPLAY_FORMAT)
+        except Exception:
+            return str(value)
+    if isinstance(value, Number):
+        return f"{value:,.0f}"
+    return str(value)
+
+
+def _build_history_record_label(record: pd.Series, dataset_key: str) -> str:
+    if dataset_key == "receivables":
+        party = record.get("counterparty", "Receivable") or "Receivable"
+        invoice_date = _format_history_value("invoice_date", record.get("invoice_date", ""))
+        return f"{party} ({invoice_date})"
+    category = record.get("sheet_name", "Other") or "Other"
+    vendor = record.get("vendor_name", "").strip() or "Unspecified vendor"
+    payment_date = _format_history_value("date", record.get("date", ""))
+    return f"{category} / {vendor} ({payment_date})"
+
+
+def summarize_edit_change(old_df: pd.DataFrame, new_df: pd.DataFrame, dataset_key: str) -> dict[str, Any]:
+    config = EDIT_HISTORY_CONFIG[dataset_key]
+    old_indexed = _build_history_index(old_df, dataset_key)
+    new_indexed = _build_history_index(new_df, dataset_key)
+
+    old_keys = set(old_indexed.index.tolist())
+    new_keys = set(new_indexed.index.tolist())
+    added_keys = [key for key in new_indexed.index if key not in old_keys]
+    removed_keys = [key for key in old_indexed.index if key not in new_keys]
+    shared_keys = [key for key in new_indexed.index if key in old_keys]
+
+    compared_columns = [
+        column
+        for column in config["detail_columns"]
+        if column in old_indexed.columns and column in new_indexed.columns
+    ]
+    modified_rows: list[tuple[str, list[str]]] = []
+    for key in shared_keys:
+        diff_fields: list[str] = []
+        for column in compared_columns:
+            old_value = old_indexed.at[key, column]
+            new_value = new_indexed.at[key, column]
+            if old_value != new_value:
+                diff_fields.append(
+                    f"{_format_history_field_name(column)}: "
+                    f"{_format_history_value(column, old_value)} -> {_format_history_value(column, new_value)}"
+                )
+        if diff_fields:
+            modified_rows.append((key, diff_fields))
+
+    old_amount = pd.to_numeric(old_df.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()
+    new_amount = pd.to_numeric(new_df.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()
+    amount_delta = new_amount - old_amount
+
+    summary_parts: list[str] = []
+    if added_keys:
+        summary_parts.append(f"{len(added_keys)} added")
+    if removed_keys:
+        summary_parts.append(f"{len(removed_keys)} removed")
+    if modified_rows:
+        summary_parts.append(f"{len(modified_rows)} updated")
+    if not summary_parts:
+        summary_parts.append("No tracked differences")
+    if amount_delta:
+        direction = "+" if amount_delta > 0 else "-"
+        summary_parts.append(f"amount {direction}Rs {format_currency(abs(amount_delta))}")
+
+    details: list[str] = []
+    for key, fields in modified_rows[:3]:
+        details.append(f"Updated {key.rsplit(' #', 1)[0]}: {'; '.join(fields[:3])}")
+    for key in added_keys[:2]:
+        record = new_indexed.loc[key]
+        details.append(f"Added {_build_history_record_label(record, dataset_key)}")
+    for key in removed_keys[:2]:
+        record = old_indexed.loc[key]
+        details.append(f"Removed {_build_history_record_label(record, dataset_key)}")
+    if not details:
+        details.append(f"{config['label']} history initialized.")
+
+    return {
+        "summary": " | ".join(summary_parts),
+        "details": details,
+        "count_delta": len(new_df) - len(old_df),
+        "amount_delta": amount_delta,
+    }
+
+
+def initialize_edit_history(dataset_key: str, initial_df: pd.DataFrame) -> None:
+    snapshot = initial_df.copy()
+    st.session_state[_edit_state_key(dataset_key)] = snapshot.copy()
+    st.session_state[_edit_history_key(dataset_key)] = [snapshot]
+    st.session_state[_edit_history_index_key(dataset_key)] = 0
+    st.session_state[_edit_history_log_key(dataset_key)] = []
+
+
+def commit_edit_history(dataset_key: str, new_df: pd.DataFrame, action_label: str) -> dict[str, Any]:
+    state_key = _edit_state_key(dataset_key)
+    history_key = _edit_history_key(dataset_key)
+    index_key = _edit_history_index_key(dataset_key)
+    log_key = _edit_history_log_key(dataset_key)
+
+    current_df = st.session_state[state_key]
+    next_df = new_df.copy()
+    if edit_frames_equal(current_df, next_df):
+        return {"changed": False, "summary": "No changes detected.", "details": []}
+
+    history: list[pd.DataFrame] = st.session_state.get(history_key, [current_df.copy()])
+    current_index = st.session_state.get(index_key, len(history) - 1)
+    history = history[: current_index + 1]
+    change_log: list[dict[str, Any]] = st.session_state.get(log_key, [])[:current_index]
+
+    change_summary = summarize_edit_change(current_df, next_df, dataset_key)
+    history.append(next_df.copy())
+    change_log.append({
+        "timestamp": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+        "action": action_label,
+        "summary": change_summary["summary"],
+        "details": change_summary["details"],
+    })
+
+    st.session_state[state_key] = next_df
+    st.session_state[history_key] = history
+    st.session_state[index_key] = len(history) - 1
+    st.session_state[log_key] = change_log
+    return {"changed": True, **change_summary}
+
+
+def step_edit_history(dataset_key: str, direction: str) -> bool:
+    history_key = _edit_history_key(dataset_key)
+    index_key = _edit_history_index_key(dataset_key)
+    state_key = _edit_state_key(dataset_key)
+
+    history: list[pd.DataFrame] = st.session_state.get(history_key, [])
+    current_index = st.session_state.get(index_key, 0)
+    target_index = current_index - 1 if direction == "undo" else current_index + 1
+    if target_index < 0 or target_index >= len(history):
+        return False
+
+    st.session_state[index_key] = target_index
+    st.session_state[state_key] = history[target_index].copy()
+    return True
+
+
+def render_track_changes_panel(dataset_key: str) -> None:
+    config = EDIT_HISTORY_CONFIG[dataset_key]
+    history: list[pd.DataFrame] = st.session_state.get(_edit_history_key(dataset_key), [])
+    history_index = st.session_state.get(_edit_history_index_key(dataset_key), 0)
+    change_log: list[dict[str, Any]] = st.session_state.get(_edit_history_log_key(dataset_key), [])
+
+    st.markdown("#### Track Changes")
+    st.caption("Undo and redo work on applied changes only.")
+
+    action_col, redo_col, info_col = st.columns([1, 1, 2])
+    with action_col:
+        undo_label = f"Undo {config['label']}"
+        if st.button(undo_label, key=f"undo_{dataset_key}", use_container_width=True, disabled=history_index == 0):
+            if step_edit_history(dataset_key, "undo"):
+                st.rerun()
+    with redo_col:
+        redo_label = f"Redo {config['label']}"
+        if st.button(
+            redo_label,
+            key=f"redo_{dataset_key}",
+            use_container_width=True,
+            disabled=history_index >= max(len(history) - 1, 0),
+        ):
+            if step_edit_history(dataset_key, "redo"):
+                st.rerun()
+    with info_col:
+        st.caption(
+            f"Version {history_index + 1} of {max(len(history), 1)}"
+            f" | Undo available: {history_index}"
+            f" | Redo available: {max(len(history) - history_index - 1, 0)}"
+        )
+
+    if not change_log:
+        st.info(f"No committed {config['line_label']} changes yet. Apply edits to start the audit trail.")
+        return
+
+    for change_number in range(len(change_log), 0, -1):
+        entry = change_log[change_number - 1]
+        status = "Active" if change_number <= history_index else "Undone"
+        with st.expander(
+            f"{status} | {entry['action']} | {entry['timestamp']}",
+            expanded=change_number == history_index,
+        ):
+            st.write(entry["summary"])
+            for detail in entry["details"]:
+                st.caption(detail)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -357,7 +947,7 @@ def build_week_ranges(selected_month: pd.Timestamp, holiday_region: str) -> list
         week_holidays = [e for e in holiday_events if week_start <= e["date"] <= week_end]
         weeks.append({
             "key": f"Week {idx}",
-            "label": f"Week {idx}: {full_date_with_day(week_start)} - {full_date_with_day(week_end)}",
+            "label": f"Week {idx}: {compact_day_date_label(week_start)} - {compact_day_date_label(week_end)}",
             "start": week_start,
             "end": week_end,
             "holidays": week_holidays,
@@ -556,24 +1146,29 @@ def evaluate_formula(expression: str, resolver: Any, visiting: set[str]) -> Any:
 #  DATA NORMALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def normalize_receivables(df: pd.DataFrame, actual_mode: bool = False) -> pd.DataFrame:
+def normalize_receivables(
+    df: pd.DataFrame,
+    sheet_name: str = "Receivables",
+    actual_mode: bool = False,
+    column_map: dict[str, str | None] | None = None,
+) -> pd.DataFrame:
     empty_cols = [
         "invoice_date", "cash_date", "tentative_collection_date", "due_date",
-        "billing_type", "billing_bucket", "description", "counterparty",
+        "billing_type", "billing_bucket", "source_sheet", "description", "counterparty",
         "amount", "ageing", "aging_bucket",
     ]
     if df.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    columns = list(df.columns)
-    date_col = find_column(columns, ["collection date", "actual date", "date"])
-    amount_col = find_column(columns, ["net receipt", "pending amt", "gross amt", "basic amt", "amount"])
-    client_col = find_column(columns, ["clients", "customer", "party", "particulars", "particualrs"])
-    ref_col = find_column(columns, ["ref no", "invoice no", "invoice number", "inv number"])
-    ageing_col = find_column(columns, ["ageing", "aging"])
-    tentative_date_col = find_column(columns, ["tentative collection date", "tentative date", "expected collection date"])
-    due_date_col = find_column(columns, ["due date"])
-    billing_type_col = find_column(columns, ["billing type"])
+    column_map = column_map or detect_receivables_columns(list(df.columns))
+    date_col = column_map.get("date")
+    amount_col = column_map.get("amount")
+    client_col = column_map.get("client")
+    ref_col = column_map.get("reference")
+    ageing_col = column_map.get("ageing")
+    tentative_date_col = column_map.get("tentative_date")
+    due_date_col = column_map.get("due_date")
+    billing_type_col = column_map.get("billing_type")
 
     if amount_col is None:
         return pd.DataFrame(columns=empty_cols)
@@ -602,6 +1197,7 @@ def normalize_receivables(df: pd.DataFrame, actual_mode: bool = False) -> pd.Dat
         "due_date": due_date,
         "billing_type": billing_type,
         "billing_bucket": billing_bucket,
+        "source_sheet": sheet_name,
         "description": description,
         "counterparty": counterparty,
         "amount": amount,
@@ -612,19 +1208,24 @@ def normalize_receivables(df: pd.DataFrame, actual_mode: bool = False) -> pd.Dat
     return normalized.reset_index(drop=True)
 
 
-def normalize_outflow_sheet(df: pd.DataFrame, sheet_name: str, actual_mode: bool = False) -> pd.DataFrame:
+def normalize_outflow_sheet(
+    df: pd.DataFrame,
+    sheet_name: str,
+    actual_mode: bool = False,
+    column_map: dict[str, str | None] | None = None,
+) -> pd.DataFrame:
     empty_cols = ["sheet_name", "date", "description", "vendor_name", "amount"]
     if df.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    columns = list(df.columns)
-    amount_col = find_column(columns, ["payable", "amount", "balance", "gross", "net amount", "net payable"])
+    column_map = column_map or detect_outflow_columns(list(df.columns))
+    amount_col = column_map.get("amount")
     if amount_col is None:
         return pd.DataFrame(columns=empty_cols)
 
     if actual_mode:
-        actual_date_col = find_column(columns, ["actual date"])
-        planned_date_col = find_column(columns, ["payment date", "plan payment date", "date", "invoice date"])
+        actual_date_col = column_map.get("actual_date")
+        planned_date_col = column_map.get("planned_date")
         if actual_date_col and planned_date_col and actual_date_col != planned_date_col:
             date_values = to_datetime(df[actual_date_col]).fillna(to_datetime(df[planned_date_col]))
         elif actual_date_col:
@@ -634,14 +1235,11 @@ def normalize_outflow_sheet(df: pd.DataFrame, sheet_name: str, actual_mode: bool
         else:
             date_values = pd.Series(pd.NaT, index=df.index)
     else:
-        date_col = find_column(columns, ["payment date", "plan payment date", "date", "invoice date"])
+        date_col = column_map.get("planned_date") or column_map.get("actual_date")
         date_values = to_datetime(df[date_col]) if date_col else pd.Series(pd.NaT, index=df.index)
 
-    vendor_col = find_column(columns, ["vendors name as per tally", "vendor name", "vendor", "supplier", "payee", "party"])
-    description_col = find_column(
-        columns,
-        ["expense", "nature of payment", "particulars", "particualrs", "invoice no", "inv. number", "inv number"],
-    )
+    vendor_col = column_map.get("vendor")
+    description_col = column_map.get("description")
 
     if date_values.isna().all():
         return pd.DataFrame(columns=empty_cols)
@@ -661,41 +1259,76 @@ def normalize_outflow_sheet(df: pd.DataFrame, sheet_name: str, actual_mode: bool
 
 
 def load_data(source: Any, actual_mode: bool = False) -> dict[str, Any]:
-    receivables = pd.DataFrame()
+    receivable_frames: list[pd.DataFrame] = []
+    inflow_sheet_order: list[str] = []
     outflow_frames: list[pd.DataFrame] = []
     outflow_sheet_order: list[str] = []
     workbook_sheets = read_workbook_sheets(source)
+    workbook_layout: dict[str, Any] = {
+        "sheet_order": list(workbook_sheets.keys()),
+        "sheet_meta": {},
+        "inflow_sheet_names": [],
+        "outflow_sheet_names": [],
+    }
 
     for sheet_name, raw in workbook_sheets.items():
         raw = raw.dropna(how="all")
+        schema = classify_sheet_schema(sheet_name, raw) if not raw.empty else {"role": "ignored", "column_map": {}, "columns": list(raw.columns)}
+        workbook_layout["sheet_meta"][sheet_name] = schema
         if raw.empty:
             continue
-        if "receivable" in sheet_name.lower():
-            receivables = normalize_receivables(raw, actual_mode=actual_mode)
-        else:
-            normalized = normalize_outflow_sheet(raw, sheet_name, actual_mode=actual_mode)
+        if schema["role"] == "receivables":
+            normalized = normalize_receivables(
+                raw,
+                sheet_name=sheet_name,
+                actual_mode=actual_mode,
+                column_map=schema["column_map"],
+            )
+            if not normalized.empty:
+                receivable_frames.append(normalized)
+                inflow_sheet_order.append(sheet_name)
+                workbook_layout["inflow_sheet_names"].append(sheet_name)
+        elif schema["role"] == "outflow":
+            normalized = normalize_outflow_sheet(raw, sheet_name, actual_mode=actual_mode, column_map=schema["column_map"])
             if not normalized.empty:
                 outflow_frames.append(normalized)
                 outflow_sheet_order.append(sheet_name)
+                workbook_layout["outflow_sheet_names"].append(sheet_name)
 
+    receivables = (
+        pd.concat(receivable_frames, ignore_index=True)
+        if receivable_frames
+        else pd.DataFrame(columns=[
+            "invoice_date", "cash_date", "tentative_collection_date", "due_date",
+            "billing_type", "billing_bucket", "source_sheet", "description", "counterparty",
+            "amount", "ageing", "aging_bucket",
+        ])
+    )
     outflows = (
         pd.concat(outflow_frames, ignore_index=True)
         if outflow_frames
         else pd.DataFrame(columns=["sheet_name", "date", "description", "vendor_name", "amount"])
     )
+    inflow_sheet_order = order_sheet_names(inflow_sheet_order)
     outflow_sheet_order = order_outflow_sheets(outflow_sheet_order)
     month_candidates = []
     if not outflows.empty:
         month_candidates.extend(outflows["date"].dropna().tolist())
+    if not receivables.empty:
+        for date_column in ["tentative_collection_date", "due_date", "invoice_date"]:
+            if date_column in receivables.columns:
+                month_candidates.extend(receivables[date_column].dropna().tolist())
     if actual_mode and not receivables.empty:
         month_candidates.extend(receivables["cash_date"].dropna().tolist())
 
     available_months = sorted({build_month_start(item) for item in month_candidates})
     return {
         "receivables": receivables,
+        "inflow_sheet_order": inflow_sheet_order,
         "outflows": outflows,
         "outflow_sheet_order": outflow_sheet_order,
         "available_months": available_months,
+        "workbook_layout": workbook_layout,
     }
 
 
@@ -788,6 +1421,70 @@ def build_actual_receivables_view(
     return receivables
 
 
+def split_weekly_receivable_buckets(
+    receipts_df: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    value_column: str,
+) -> dict[str, float]:
+    if receipts_df.empty:
+        return {
+            "advance": 0.0,
+            "receivables": 0.0,
+            "due_within_week": 0.0,
+            "overdue": 0.0,
+            "total": 0.0,
+        }
+
+    bucket_masks = classify_weekly_receivable_masks(receipts_df, start, end)
+    advance_mask = bucket_masks["advance"]
+    receivable_mask = bucket_masks["receivables"]
+    due_within_week_mask = bucket_masks["due_within_week"]
+    overdue_mask = bucket_masks["overdue"]
+
+    return {
+        "advance": receipts_df.loc[advance_mask, value_column].sum(),
+        "receivables": receipts_df.loc[receivable_mask, value_column].sum(),
+        "due_within_week": receipts_df.loc[due_within_week_mask, value_column].sum(),
+        "overdue": receipts_df.loc[overdue_mask, value_column].sum(),
+        "total": receipts_df[value_column].sum(),
+    }
+
+
+def classify_weekly_receivable_masks(
+    receipts_df: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> dict[str, pd.Series]:
+    billing_bucket = receipts_df.get("billing_bucket", pd.Series("Receivables", index=receipts_df.index)).fillna("Receivables")
+    due_dates = (
+        to_datetime(receipts_df["due_date"])
+        if "due_date" in receipts_df.columns
+        else pd.Series(pd.NaT, index=receipts_df.index)
+    )
+    # Weekly collections are already filtered to the week by tentative / forecast collection date.
+    # Within that bucket:
+    # - Advance = invoices not yet due as of the week end, plus rows explicitly tagged Advance
+    # - Receivables = invoices already due or becoming due within the week
+    explicit_advance_mask = billing_bucket == "Advance"
+    future_due_mask = due_dates.notna() & (due_dates > end)
+    advance_mask = explicit_advance_mask | future_due_mask
+    receivable_mask = ~advance_mask
+    overdue_mask = receivable_mask & due_dates.notna() & (due_dates < start)
+    due_within_week_mask = receivable_mask & due_dates.between(start, end, inclusive="both")
+    # If due date is blank on a non-advance row, keep it under receivables and default it to due within week.
+    unknown_due_mask = receivable_mask & due_dates.isna()
+    due_within_week_mask = due_within_week_mask | unknown_due_mask
+
+    return {
+        "advance": advance_mask,
+        "receivables": receivable_mask,
+        "due_within_week": due_within_week_mask,
+        "overdue": overdue_mask,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FILTERING & HORIZON HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -841,6 +1538,53 @@ def compute_monthly_rollforward(
         })
         running_open = closing
     return pd.DataFrame(rows)
+
+
+def compute_od_cash_movement(
+    opening_cash: float,
+    opening_od_outstanding: float,
+    collections: float,
+    outflows: float,
+    od_sanctioned_limit: float,
+    *,
+    cash_buffer: float = DEFAULT_MIN_CASH_THRESHOLD,
+) -> dict[str, float]:
+    cash_before_od = opening_cash + collections - outflows
+    draw_capacity = (
+        max(od_sanctioned_limit - opening_od_outstanding, 0.0)
+        if od_sanctioned_limit > 0
+        else np.inf
+    )
+
+    od_movement = 0.0
+    ending_od_outstanding = opening_od_outstanding
+    ending_cash = cash_before_od
+
+    if cash_before_od < 0:
+        required_draw = -cash_before_od
+        draw_amount = min(required_draw, draw_capacity)
+        od_movement = draw_amount
+        ending_od_outstanding = opening_od_outstanding + draw_amount
+        ending_cash = cash_before_od + draw_amount
+    elif opening_od_outstanding > 0 and cash_before_od > cash_buffer:
+        repay_amount = min(cash_before_od - cash_buffer, opening_od_outstanding)
+        od_movement = -repay_amount
+        ending_od_outstanding = opening_od_outstanding - repay_amount
+        ending_cash = cash_before_od - repay_amount
+
+    return {
+        "opening_cash": opening_cash,
+        "opening_od_outstanding": opening_od_outstanding,
+        "cash_before_od": cash_before_od,
+        "od_movement": od_movement,
+        "ending_od_outstanding": ending_od_outstanding,
+        "ending_cash": ending_cash,
+        "available_headroom": (
+            max(od_sanctioned_limit - ending_od_outstanding, 0.0)
+            if od_sanctioned_limit > 0
+            else 0.0
+        ),
+    }
 
 
 def build_monthly_detail_matrix(
@@ -911,20 +1655,17 @@ def build_week_detail(
         week_plan_receipts = filter_between(plan_receivables, "forecast_collection_date", active_start, end)
         week_plan_outflows = filter_between(plan_outflows, "date", active_start, end)
 
-    plan_billing_bucket = (
-        week_plan_receipts["billing_bucket"]
-        if "billing_bucket" in week_plan_receipts.columns
-        else pd.Series("Arrear", index=week_plan_receipts.index)
+    plan_receivable_split = split_weekly_receivable_buckets(
+        week_plan_receipts,
+        active_start,
+        end,
+        value_column="expected_base",
     )
-    plan_advance_collections = (
-        week_plan_receipts.loc[plan_billing_bucket == "Advance", "expected_base"].sum()
-        if not week_plan_receipts.empty else 0.0
-    )
-    plan_arrear_collections = (
-        week_plan_receipts.loc[plan_billing_bucket != "Advance", "expected_base"].sum()
-        if not week_plan_receipts.empty else 0.0
-    )
-    plan_collections = week_plan_receipts["expected_base"].sum() if not week_plan_receipts.empty else 0.0
+    plan_advance_collections = plan_receivable_split["advance"]
+    plan_receivable_collections = plan_receivable_split["receivables"]
+    plan_due_within_week_collections = plan_receivable_split["due_within_week"]
+    plan_overdue_collections = plan_receivable_split["overdue"]
+    plan_collections = plan_receivable_split["total"]
     plan_by_category = (
         week_plan_outflows.groupby("sheet_name", as_index=True)["amount"]
         .sum()
@@ -941,7 +1682,9 @@ def build_week_detail(
     actual_week_receipts = pd.DataFrame()
     actual_week_outflows = pd.DataFrame()
     actual_advance_collections = 0.0
-    actual_arrear_collections = 0.0
+    actual_receivable_collections = 0.0
+    actual_due_within_week_collections = 0.0
+    actual_overdue_collections = 0.0
 
     if actual_data:
         actual_receivables = build_actual_receivables_view(
@@ -955,20 +1698,17 @@ def build_week_detail(
         if active_start <= end:
             actual_week_receipts = filter_between(actual_receivables, "comparison_date", active_start, end)
             actual_week_outflows = filter_between(actual_outflows_df, "date", active_start, end)
-        actual_collections = actual_week_receipts["comparison_amount"].sum() if not actual_week_receipts.empty else 0.0
-        actual_billing_bucket = (
-            actual_week_receipts["billing_bucket"]
-            if "billing_bucket" in actual_week_receipts.columns
-            else pd.Series("Arrear", index=actual_week_receipts.index)
+        actual_receivable_split = split_weekly_receivable_buckets(
+            actual_week_receipts,
+            active_start,
+            end,
+            value_column="comparison_amount",
         )
-        actual_advance_collections = (
-            actual_week_receipts.loc[actual_billing_bucket == "Advance", "comparison_amount"].sum()
-            if not actual_week_receipts.empty else 0.0
-        )
-        actual_arrear_collections = (
-            actual_week_receipts.loc[actual_billing_bucket != "Advance", "comparison_amount"].sum()
-            if not actual_week_receipts.empty else 0.0
-        )
+        actual_collections = actual_receivable_split["total"]
+        actual_advance_collections = actual_receivable_split["advance"]
+        actual_receivable_collections = actual_receivable_split["receivables"]
+        actual_due_within_week_collections = actual_receivable_split["due_within_week"]
+        actual_overdue_collections = actual_receivable_split["overdue"]
         actual_by_category = (
             actual_week_outflows.groupby("sheet_name", as_index=True)["amount"]
             .sum()
@@ -985,7 +1725,9 @@ def build_week_detail(
         "plan_receipts_detail": week_plan_receipts,
         "plan_outflows_detail": week_plan_outflows,
         "plan_advance_collections": plan_advance_collections,
-        "plan_arrear_collections": plan_arrear_collections,
+        "plan_receivable_collections": plan_receivable_collections,
+        "plan_due_within_week_collections": plan_due_within_week_collections,
+        "plan_overdue_collections": plan_overdue_collections,
         "plan_collections": plan_collections,
         "plan_by_category": plan_by_category,
         "plan_total_outflows": total_outflows,
@@ -993,7 +1735,9 @@ def build_week_detail(
         "actual_receipts_detail": actual_week_receipts,
         "actual_outflows_detail": actual_week_outflows,
         "actual_advance_collections": actual_advance_collections,
-        "actual_arrear_collections": actual_arrear_collections,
+        "actual_receivable_collections": actual_receivable_collections,
+        "actual_due_within_week_collections": actual_due_within_week_collections,
+        "actual_overdue_collections": actual_overdue_collections,
         "actual_collections": actual_collections,
         "actual_by_category": actual_by_category,
         "actual_net": actual_net,
@@ -1017,6 +1761,8 @@ def compute_weekly_cashflow(
     tds_rate: float = 0.0,
     od_sanctioned_limit: float = 0.0,
     od_interest_rate_pa: float = 0.0,
+    opening_od_utilization: float = 0.0,
+    od_buffer_balance: float = DEFAULT_MIN_CASH_THRESHOLD,
 ) -> dict[str, Any]:
     month_start = build_month_start(selected_month)
     month_end = build_month_end(selected_month)
@@ -1064,7 +1810,9 @@ def compute_weekly_cashflow(
     )
 
     running_plan = opening_balance
+    running_plan_od = max(opening_od_utilization, 0.0)
     running_actual = opening_balance if actual_data else None
+    running_actual_od = max(opening_od_utilization, 0.0) if actual_data else None
     week_meta: list[dict[str, Any]] = []
 
     for week in weeks:
@@ -1088,66 +1836,95 @@ def compute_weekly_cashflow(
         if week_detail["effective_start"] > week_detail["end"]:
             week_detail["opening_plan"] = None
             week_detail["ending_plan"] = None
+            week_detail["opening_plan_od_outstanding"] = None
             week_detail["plan_od_utilization"] = None
+            week_detail["ending_plan_od_outstanding"] = None
+            week_detail["plan_od_headroom"] = None
             week_detail["plan_total_inflows"] = None
+            week_detail["plan_surplus_deficit"] = None
             week_detail["plan_od_interest"] = None
         else:
             week_detail["opening_plan"] = running_plan
-            raw_od = max(
-                week_detail["plan_total_outflows"] - (running_plan + week_detail["plan_collections"]), 0.0
+            week_detail["opening_plan_od_outstanding"] = running_plan_od
+            od_result = compute_od_cash_movement(
+                running_plan,
+                running_plan_od,
+                week_detail["plan_collections"],
+                week_detail["plan_total_outflows"],
+                od_sanctioned_limit,
+                cash_buffer=od_buffer_balance,
             )
-            # Cap OD at sanctioned limit
-            capped_od = min(raw_od, od_sanctioned_limit) if od_sanctioned_limit > 0 else raw_od
-            week_detail["plan_od_utilization"] = capped_od
-            week_detail["plan_total_inflows"] = (
-                week_detail["plan_collections"] + week_detail["plan_od_utilization"]
-            )
+            week_detail["plan_od_utilization"] = od_result["od_movement"]
+            week_detail["ending_plan_od_outstanding"] = od_result["ending_od_outstanding"]
+            week_detail["plan_od_headroom"] = od_result["available_headroom"]
+            week_detail["plan_total_inflows"] = week_detail["plan_collections"]
             week_detail["plan_net"] = (
                 week_detail["plan_total_inflows"] - week_detail["plan_total_outflows"]
             )
-            week_detail["ending_plan"] = running_plan + week_detail["plan_net"]
+            week_detail["plan_surplus_deficit"] = od_result["cash_before_od"]
+            week_detail["ending_plan"] = od_result["ending_cash"]
             # Estimated OD interest for this week
             week_detail["plan_od_interest"] = (
-                capped_od * (od_interest_rate_pa / 100.0) / 365.0 * days_in_week
-                if od_interest_rate_pa > 0 and capped_od > 0
+                ((running_plan_od + od_result["ending_od_outstanding"]) / 2.0)
+                * (od_interest_rate_pa / 100.0) / 365.0 * days_in_week
+                if od_interest_rate_pa > 0 and (running_plan_od > 0 or od_result["ending_od_outstanding"] > 0)
                 else 0.0
             )
             running_plan = week_detail["ending_plan"]
+            running_plan_od = od_result["ending_od_outstanding"]
 
         if actual_data:
             if week_detail["effective_start"] > week_detail["end"]:
                 week_detail["opening_actual"] = None
                 week_detail["ending_actual"] = None
+                week_detail["opening_actual_od_outstanding"] = None
                 week_detail["actual_od_utilization"] = None
+                week_detail["ending_actual_od_outstanding"] = None
+                week_detail["actual_od_headroom"] = None
                 week_detail["actual_total_inflows"] = None
                 week_detail["unexpected"] = None
                 week_detail["actual_od_interest"] = None
             else:
                 week_detail["opening_actual"] = running_actual
+                week_detail["opening_actual_od_outstanding"] = running_actual_od
                 actual_outflow_total = week_detail["actual_by_category"].sum()
-                raw_od_actual = max(
-                    actual_outflow_total - (running_actual + week_detail["actual_collections"]), 0.0
+                actual_od_result = compute_od_cash_movement(
+                    running_actual,
+                    running_actual_od or 0.0,
+                    week_detail["actual_collections"],
+                    actual_outflow_total,
+                    od_sanctioned_limit,
+                    cash_buffer=od_buffer_balance,
                 )
-                capped_od_actual = min(raw_od_actual, od_sanctioned_limit) if od_sanctioned_limit > 0 else raw_od_actual
-                week_detail["actual_od_utilization"] = capped_od_actual
-                week_detail["actual_total_inflows"] = (
-                    week_detail["actual_collections"] + week_detail["actual_od_utilization"]
-                )
+                week_detail["actual_od_utilization"] = actual_od_result["od_movement"]
+                week_detail["ending_actual_od_outstanding"] = actual_od_result["ending_od_outstanding"]
+                week_detail["actual_od_headroom"] = actual_od_result["available_headroom"]
+                week_detail["actual_total_inflows"] = week_detail["actual_collections"]
                 actual_net = week_detail["actual_total_inflows"] - actual_outflow_total
                 week_detail["actual_net"] = actual_net
-                week_detail["ending_actual"] = running_actual + actual_net
+                week_detail["actual_surplus_deficit"] = actual_od_result["cash_before_od"]
+                week_detail["ending_actual"] = actual_od_result["ending_cash"]
                 running_actual = week_detail["ending_actual"]
+                running_actual_od = actual_od_result["ending_od_outstanding"]
                 week_detail["unexpected"] = actual_net - (week_detail["plan_net"] or 0.0)
                 week_detail["actual_od_interest"] = (
-                    capped_od_actual * (od_interest_rate_pa / 100.0) / 365.0 * days_in_week
-                    if od_interest_rate_pa > 0 and capped_od_actual > 0
+                    (((week_detail["opening_actual_od_outstanding"] or 0.0) + actual_od_result["ending_od_outstanding"]) / 2.0)
+                    * (od_interest_rate_pa / 100.0) / 365.0 * days_in_week
+                    if od_interest_rate_pa > 0 and (
+                        (week_detail["opening_actual_od_outstanding"] or 0.0) > 0
+                        or actual_od_result["ending_od_outstanding"] > 0
+                    )
                     else 0.0
                 )
         else:
             week_detail["opening_actual"] = None
             week_detail["ending_actual"] = None
+            week_detail["opening_actual_od_outstanding"] = None
             week_detail["actual_od_utilization"] = None
+            week_detail["ending_actual_od_outstanding"] = None
+            week_detail["actual_od_headroom"] = None
             week_detail["actual_total_inflows"] = None
+            week_detail["actual_surplus_deficit"] = None
             week_detail["unexpected"] = (
                 None if week_detail["effective_start"] > week_detail["end"] else 0.0
             )
@@ -1161,16 +1938,20 @@ def compute_weekly_cashflow(
 
     # ── Build table rows ──────────────────────────────────────────────────────
     line_items = [
-        "Opening Balance", "Collections", "   Advance", "   Arrear",
-        "   OD Utilization", "Total Inflows", "Cash Outflows",
+        "Inflows",
+        "   Advance",
+        "   Receivables",
+        "      Due Within Week",
+        "      Overdue",
+        "Total Inflows",
+        "Cash Outflows",
     ]
     line_items.extend([f"   {sheet}" for sheet in outflow_sheet_order])
     line_items.extend([
         "Total Outflows",
         "Net Movement of Cash",
-        "Ending Cash Balance (Planned)",
-        "Ending Cash Balance (Actual)",
-        "Unexpected Spends / Savings",
+        "Opening Balance incl. OD Opening O/S",
+        "Closing Balance",
     ])
 
     week_values: dict[str, dict[str, Any]] = {item: {} for item in line_items}
@@ -1181,24 +1962,33 @@ def compute_weekly_cashflow(
             for item in line_items:
                 week_values[item][key] = None
             continue
-        week_values["Opening Balance"][key] = wd["opening_plan"]
-        week_values["Collections"][key] = wd["plan_collections"]
+        week_values["Inflows"][key] = None
         week_values["   Advance"][key] = wd["plan_advance_collections"]
-        week_values["   Arrear"][key] = wd["plan_arrear_collections"]
-        week_values["   OD Utilization"][key] = wd["plan_od_utilization"]
+        week_values["   Receivables"][key] = wd["plan_receivable_collections"]
+        week_values["      Due Within Week"][key] = wd["plan_due_within_week_collections"]
+        week_values["      Overdue"][key] = wd["plan_overdue_collections"]
         week_values["Total Inflows"][key] = wd["plan_total_inflows"]
         week_values["Cash Outflows"][key] = None
         for sheet in outflow_sheet_order:
             week_values[f"   {sheet}"][key] = wd["plan_by_category"].get(sheet, 0.0)
         week_values["Total Outflows"][key] = wd["plan_total_outflows"]
         week_values["Net Movement of Cash"][key] = wd["plan_net"]
-        week_values["Ending Cash Balance (Planned)"][key] = wd["ending_plan"]
-        week_values["Ending Cash Balance (Actual)"][key] = wd["ending_actual"]
-        week_values["Unexpected Spends / Savings"][key] = wd["unexpected"] if actual_data else None
+        week_values["Opening Balance incl. OD Opening O/S"][key] = (
+            (wd["opening_plan"] or 0.0) - (wd["opening_plan_od_outstanding"] or 0.0)
+            if wd["opening_plan"] is not None
+            else None
+        )
+        week_values["Closing Balance"][key] = (
+            (wd["ending_plan"] or 0.0) - (wd["ending_plan_od_outstanding"] or 0.0)
+            if wd["ending_plan"] is not None
+            else None
+        )
 
     active_weeks = [wd for wd in week_meta if wd["effective_start"] <= wd["end"]]
     monthly_plan_advance = sum(wd["plan_advance_collections"] for wd in active_weeks)
-    monthly_plan_arrear = sum(wd["plan_arrear_collections"] for wd in active_weeks)
+    monthly_plan_receivables = sum(wd["plan_receivable_collections"] for wd in active_weeks)
+    monthly_plan_due_within_week = sum(wd["plan_due_within_week_collections"] for wd in active_weeks)
+    monthly_plan_overdue = sum(wd["plan_overdue_collections"] for wd in active_weeks)
     monthly_plan_collections = sum(wd["plan_collections"] for wd in active_weeks)
     monthly_plan_od_utilization = sum(wd["plan_od_utilization"] or 0.0 for wd in active_weeks)
     monthly_plan_total_inflows = sum(wd["plan_total_inflows"] or 0.0 for wd in active_weeks)
@@ -1212,19 +2002,31 @@ def compute_weekly_cashflow(
     )
     monthly_plan_outflows = sum(wd["plan_total_outflows"] for wd in active_weeks)
     monthly_plan_net = sum(wd["plan_net"] for wd in active_weeks)
+    monthly_plan_opening_incl_od = opening_balance - max(opening_od_utilization, 0.0)
     monthly_plan_ending = active_weeks[-1]["ending_plan"] if active_weeks else opening_balance
     monthly_plan_od_interest = sum(wd.get("plan_od_interest") or 0.0 for wd in active_weeks)
+    monthly_plan_ending_od = active_weeks[-1]["ending_plan_od_outstanding"] if active_weeks else running_plan_od
+    monthly_plan_closing = monthly_plan_ending - monthly_plan_ending_od
+    monthly_plan_headroom = (
+        max(od_sanctioned_limit - monthly_plan_ending_od, 0.0)
+        if od_sanctioned_limit > 0
+        else 0.0
+    )
 
     # ── Actuals monthly aggregation ───────────────────────────────────────────
-    actual_month_collections = actual_month_advance = actual_month_arrear = None
+    actual_month_collections = actual_month_advance = actual_month_receivables = None
+    actual_month_due_within_week = actual_month_overdue = None
     actual_month_od_utilization = actual_month_total_inflows = None
     actual_month_by_category = pd.Series(dtype=float)
     actual_month_outflows = actual_month_net = actual_month_ending = None
-    unexpected_month = None
+    actual_month_ending_od = None
+    actual_month_closing = None
 
     if actual_data:
         actual_month_advance = sum((wd.get("actual_advance_collections") or 0.0) for wd in active_weeks)
-        actual_month_arrear = sum((wd.get("actual_arrear_collections") or 0.0) for wd in active_weeks)
+        actual_month_receivables = sum((wd.get("actual_receivable_collections") or 0.0) for wd in active_weeks)
+        actual_month_due_within_week = sum((wd.get("actual_due_within_week_collections") or 0.0) for wd in active_weeks)
+        actual_month_overdue = sum((wd.get("actual_overdue_collections") or 0.0) for wd in active_weeks)
         actual_month_collections = sum((wd.get("actual_collections") or 0.0) for wd in active_weeks)
         actual_month_od_utilization = sum((wd.get("actual_od_utilization") or 0.0) for wd in active_weeks)
         actual_month_total_inflows = sum((wd.get("actual_total_inflows") or 0.0) for wd in active_weeks)
@@ -1239,28 +2041,37 @@ def compute_weekly_cashflow(
         actual_month_outflows = actual_month_by_category.sum()
         actual_month_net = sum((wd.get("actual_net") or 0.0) for wd in active_weeks)
         actual_month_ending = active_weeks[-1]["ending_actual"] if active_weeks else opening_balance
-        unexpected_month = actual_month_net - monthly_plan_net
+        actual_month_ending_od = (
+            active_weeks[-1].get("ending_actual_od_outstanding")
+            if active_weeks
+            else max(opening_od_utilization, 0.0)
+        )
+        actual_month_closing = (
+            actual_month_ending - (actual_month_ending_od or 0.0)
+            if actual_month_ending is not None
+            else None
+        )
 
     table_rows = []
     for line_item in line_items:
         row = {"Line Item": line_item}
         for week in weeks:
             row[week["key"]] = week_values[line_item].get(week["key"])
-        if line_item == "Opening Balance":
-            row["Fcst (Selected Month)"] = opening_balance
-            row["Actual (if available)"] = opening_balance if actual_data else None
-        elif line_item == "Collections":
-            row["Fcst (Selected Month)"] = monthly_plan_collections
-            row["Actual (if available)"] = actual_month_collections
+        if line_item == "Inflows":
+            row["Fcst (Selected Month)"] = None
+            row["Actual (if available)"] = None
         elif line_item == "   Advance":
             row["Fcst (Selected Month)"] = monthly_plan_advance
             row["Actual (if available)"] = actual_month_advance
-        elif line_item == "   Arrear":
-            row["Fcst (Selected Month)"] = monthly_plan_arrear
-            row["Actual (if available)"] = actual_month_arrear
-        elif line_item == "   OD Utilization":
-            row["Fcst (Selected Month)"] = monthly_plan_od_utilization
-            row["Actual (if available)"] = actual_month_od_utilization
+        elif line_item == "   Receivables":
+            row["Fcst (Selected Month)"] = monthly_plan_receivables
+            row["Actual (if available)"] = actual_month_receivables
+        elif line_item == "      Due Within Week":
+            row["Fcst (Selected Month)"] = monthly_plan_due_within_week
+            row["Actual (if available)"] = actual_month_due_within_week
+        elif line_item == "      Overdue":
+            row["Fcst (Selected Month)"] = monthly_plan_overdue
+            row["Actual (if available)"] = actual_month_overdue
         elif line_item == "Total Inflows":
             row["Fcst (Selected Month)"] = monthly_plan_total_inflows
             row["Actual (if available)"] = actual_month_total_inflows
@@ -1279,15 +2090,12 @@ def compute_weekly_cashflow(
         elif line_item == "Net Movement of Cash":
             row["Fcst (Selected Month)"] = monthly_plan_net
             row["Actual (if available)"] = actual_month_net
-        elif line_item == "Ending Cash Balance (Planned)":
-            row["Fcst (Selected Month)"] = monthly_plan_ending
-            row["Actual (if available)"] = None
-        elif line_item == "Ending Cash Balance (Actual)":
-            row["Fcst (Selected Month)"] = None
-            row["Actual (if available)"] = actual_month_ending
-        elif line_item == "Unexpected Spends / Savings":
-            row["Fcst (Selected Month)"] = 0.0
-            row["Actual (if available)"] = unexpected_month
+        elif line_item == "Opening Balance incl. OD Opening O/S":
+            row["Fcst (Selected Month)"] = monthly_plan_opening_incl_od
+            row["Actual (if available)"] = monthly_plan_opening_incl_od if actual_data else None
+        elif line_item == "Closing Balance":
+            row["Fcst (Selected Month)"] = monthly_plan_closing
+            row["Actual (if available)"] = actual_month_closing
         table_rows.append(row)
 
     matrix = pd.DataFrame(table_rows)
@@ -1309,8 +2117,13 @@ def compute_weekly_cashflow(
             "outflows": monthly_plan_outflows,
             "net": monthly_plan_net,
             "ending": monthly_plan_ending,
-            "od_utilization": monthly_plan_od_utilization,
+            "opening_od_utilization": max(opening_od_utilization, 0.0),
+            "od_movement": monthly_plan_od_utilization,
+            "od_utilization": monthly_plan_ending_od,
+            "available_od_limit": monthly_plan_headroom,
+            "ending_excl_od": monthly_plan_ending - monthly_plan_ending_od,
             "od_interest_est": monthly_plan_od_interest,
+            "od_buffer_balance": od_buffer_balance,
         },
     }
 
@@ -1393,12 +2206,10 @@ def compare_actual_vs_budget(
     ending_actual = np.nan
     for _, record in table.iterrows():
         line_item = str(record["Line Item"]).strip()
-        if line_item == "Cash Outflows":
+        if line_item in {"Inflows", "Cash Outflows"}:
             continue
-        if line_item == "Ending Cash Balance (Planned)":
+        if line_item == "Closing Balance":
             ending_planned = record["Fcst (Selected Month)"]
-            continue
-        if line_item == "Ending Cash Balance (Actual)":
             ending_actual = record["Actual (if available)"]
             continue
         planned = record["Fcst (Selected Month)"]
@@ -1433,21 +2244,33 @@ def summarize_line_dates(series: pd.Series) -> str:
 
 def summarize_inflow_detail(df: pd.DataFrame, *, value_column: str, value_label: str) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame(columns=["Billing Type", "Client", "Due Window", "Forecast Window", value_label, "Source Rows"])
+        return pd.DataFrame(columns=["Inflow Sheet", "Billing Type", "Client", "Due Date", "Forecast Date", value_label, "Count of Invoices"])
     working_df = df.copy()
     working_df["_summary_line"] = build_summary_label(working_df, "counterparty", "description", "Collections")
-    working_df["_billing_bucket"] = working_df.get("billing_bucket", pd.Series("Arrear", index=working_df.index)).fillna("Arrear")
+    inflow_sheets = (
+        working_df.get("source_sheet", pd.Series("Inflows", index=working_df.index))
+        .fillna("Inflows")
+        .astype(str)
+        .str.strip()
+        .replace("", "Inflows")
+    )
+    working_df["_source_sheet"] = inflow_sheets
+    working_df["_billing_bucket"] = (
+        working_df.get("billing_bucket", pd.Series("Receivables", index=working_df.index))
+        .fillna("Receivables")
+        .map(normalize_billing_bucket)
+    )
     return (
-        working_df.groupby(["_billing_bucket", "_summary_line"], dropna=False)
+        working_df.groupby(["_source_sheet", "_billing_bucket", "_summary_line"], dropna=False)
         .agg(**{
             value_label: (value_column, "sum"),
-            "Due Window": ("due_date", summarize_line_dates),
-            "Forecast Window": ("forecast_collection_date", summarize_line_dates),
-            "Source Rows": (value_column, "size"),
+            "Due Date": ("due_date", summarize_line_dates),
+            "Forecast Date": ("forecast_collection_date", summarize_line_dates),
+            "Count of Invoices": (value_column, "size"),
         })
         .reset_index()
-        .rename(columns={"_billing_bucket": "Billing Type", "_summary_line": "Client"})
-        .sort_values(by=["Billing Type", value_label, "Client"], ascending=[True, False, True], kind="stable")
+        .rename(columns={"_source_sheet": "Inflow Sheet", "_billing_bucket": "Billing Type", "_summary_line": "Client"})
+        .sort_values(by=["Inflow Sheet", "Billing Type", value_label, "Client"], ascending=[True, True, False, True], kind="stable")
         .reset_index(drop=True)
     )
 
@@ -1469,6 +2292,164 @@ def summarize_outflow_detail(df: pd.DataFrame, *, value_label: str = "Amount") -
         .sort_values(by=["Category", value_label, "Vendor"], ascending=[True, False, True], kind="stable")
         .reset_index(drop=True)
     )
+
+
+def prepare_inflow_line_item_table(df: pd.DataFrame) -> pd.DataFrame:
+    inflows = round_numeric_columns(
+        df.copy(),
+        percent_columns=["base_probability", "best_probability", "worst_probability"],
+    )
+    for column in ["billing_type", "billing_bucket"]:
+        if column in inflows.columns:
+            inflows[column] = inflows[column].map(normalize_billing_bucket)
+    if inflows.empty:
+        return pd.DataFrame(columns=[
+            "Invoice Date", "Tentative Collection Date", "Forecast Collection Date", "Due Date",
+            "Billing Type", "Billing Bucket", "Client", "Reference",
+            "Invoice Amount", "Aging Bucket", "Base Probability",
+            "Expected Base Collection",
+        ])
+    keep_cols = [
+        "invoice_date", "tentative_collection_date", "forecast_collection_date", "due_date",
+        "source_sheet", "billing_type", "billing_bucket", "counterparty", "description", "amount", "aging_bucket",
+        "base_probability", "best_probability", "worst_probability",
+        "expected_base", "expected_best", "expected_worst",
+    ]
+    return inflows[[c for c in keep_cols if c in inflows.columns]].rename(columns={
+        "invoice_date": "Invoice Date",
+        "tentative_collection_date": "Tentative Collection Date",
+        "forecast_collection_date": "Forecast Collection Date",
+        "due_date": "Due Date",
+        "source_sheet": "Inflow Sheet",
+        "billing_type": "Billing Type",
+        "billing_bucket": "Billing Bucket",
+        "counterparty": "Client",
+        "description": "Reference",
+        "amount": "Invoice Amount",
+        "aging_bucket": "Aging Bucket",
+        "base_probability": "Base Probability",
+        "best_probability": "Best Probability",
+        "worst_probability": "Worst Probability",
+        "expected_base": "Expected Base Collection",
+        "expected_best": "Expected Best Collection",
+        "expected_worst": "Expected Worst Collection",
+    })
+
+
+def prepare_outflow_line_item_table(df: pd.DataFrame) -> pd.DataFrame:
+    outflows = round_numeric_columns(df.copy())
+    if outflows.empty:
+        return pd.DataFrame(columns=["Category", "Vendor", "Particular", "Payment Date", "Amount"])
+    return outflows[[c for c in ["sheet_name", "vendor_name", "description", "date", "amount"] if c in outflows.columns]].rename(columns={
+        "sheet_name": "Category",
+        "vendor_name": "Vendor",
+        "description": "Particular",
+        "date": "Payment Date",
+        "amount": "Amount",
+    })
+
+
+def resolve_weekly_drilldown_selection(
+    weekly_cashflow: dict[str, Any],
+    selected_month: pd.Timestamp,
+) -> dict[str, Any] | None:
+    params = get_query_params()
+    selected_scope = params.get("weekly_drill_scope", "")
+    if selected_scope != selected_month.strftime("%Y-%m"):
+        return None
+
+    week_key = params.get("weekly_drill_week", "")
+    line_item = params.get("weekly_drill_line", "")
+    week = next((entry for entry in weekly_cashflow["week_meta"] if entry["key"] == week_key), None)
+    if week is None:
+        return None
+
+    outflow_categories = list(week["plan_by_category"].index)
+    drill_config = classify_weekly_drilldown_line_item(line_item, outflow_categories)
+    if drill_config is None:
+        return None
+
+    if drill_config["section"] == "inflows":
+        inflow_detail = week["plan_receipts_detail"].copy()
+        if drill_config["mode"] in {"advance", "receivables", "due_within_week", "overdue"}:
+            bucket_masks = classify_weekly_receivable_masks(
+                inflow_detail,
+                week["effective_start"],
+                week["end"],
+            )
+            inflow_detail = inflow_detail.loc[bucket_masks[drill_config["mode"]]].copy()
+        return {
+            "title": f"{week['key']} - {drill_config['label']}",
+            "subtitle": week["label"],
+            "summary_df": summarize_inflow_detail(
+                inflow_detail,
+                value_column="expected_base",
+                value_label="Expected Collection",
+            ),
+            "summary_currency_columns": ["Expected Collection"],
+            "detail_df": prepare_inflow_line_item_table(inflow_detail),
+            "detail_currency_columns": ["Invoice Amount", "Expected Base Collection", "Expected Best Collection", "Expected Worst Collection"],
+            "detail_percent_columns": ["Base Probability", "Best Probability", "Worst Probability"],
+            "empty_message": "No inflow line items found for this week selection.",
+        }
+
+    outflow_detail = week["plan_outflows_detail"].copy()
+    if drill_config["mode"] == "category":
+        outflow_detail = outflow_detail.loc[
+            outflow_detail["sheet_name"].astype(str).map(standardize_label) == standardize_label(drill_config["category"])
+        ].copy()
+    return {
+        "title": f"{week['key']} - {drill_config['label']}",
+        "subtitle": week["label"],
+        "summary_df": summarize_outflow_detail(outflow_detail),
+        "summary_currency_columns": ["Amount"],
+        "detail_df": prepare_outflow_line_item_table(outflow_detail),
+        "detail_currency_columns": ["Amount"],
+        "detail_percent_columns": [],
+        "empty_message": "No outflow line items found for this week selection.",
+    }
+
+
+def render_weekly_drilldown_selection(
+    weekly_cashflow: dict[str, Any],
+    selected_month: pd.Timestamp,
+) -> None:
+    st.markdown("**Weekly Cell Drill-Down**")
+    selection = resolve_weekly_drilldown_selection(weekly_cashflow, selected_month)
+    if selection is None:
+        st.caption("Click a weekly amount in Advance, Receivables, Due Within Week, Overdue, Total Inflows, Total Outflows, or an outflow category row to inspect supporting line items.")
+        return
+
+    title_col, action_col = st.columns([5, 1])
+    with title_col:
+        st.caption(selection["subtitle"])
+        st.markdown(f"**{selection['title']}**")
+    with action_col:
+        if st.button("Clear", key="clear_weekly_drilldown", use_container_width=True):
+            clear_weekly_drilldown_query_params()
+            st.rerun()
+
+    if selection["detail_df"].empty:
+        st.info(selection["empty_message"])
+        return
+
+    st.caption("Grouped summary")
+    render_simple_table(
+        selection["summary_df"],
+        currency_columns=selection["summary_currency_columns"],
+        enable_sort=True,
+        sort_key_prefix="weekly_drilldown_summary",
+        sortable_columns=selection["summary_df"].columns.tolist(),
+    )
+    with st.expander("Show underlying line items", expanded=False):
+        render_simple_table(
+            selection["detail_df"],
+            currency_columns=selection["detail_currency_columns"],
+            percent_columns=selection["detail_percent_columns"],
+            enable_sort=True,
+            sort_key_prefix="weekly_drilldown_detail",
+            sortable_columns=selection["detail_df"].columns.tolist(),
+        )
 
 
 def build_line_level_variance(
@@ -1498,6 +2479,7 @@ def build_line_level_variance(
     actual_receivables = filter_between(actual_receivables_view, "comparison_date", month_start, month_end)
     plan_outflows = filter_between(weekly_cashflow["plan_outflows"], "date", month_start, month_end)
     actual_outflows = filter_between(actual_data["outflows"], "date", month_start, month_end)
+    inflow_category_column = "source_sheet" if "source_sheet" in plan_receivables.columns or "source_sheet" in actual_receivables.columns else None
 
     def aggregate_lines(
         df, *, section, category_column, summary_column, summary_fallback_column,
@@ -1528,7 +2510,7 @@ def build_line_level_variance(
         return aggregated
 
     planned_lines = pd.concat([
-        aggregate_lines(plan_receivables, section="Collections", category_column=None,
+        aggregate_lines(plan_receivables, section="Collections", category_column=inflow_category_column,
                         summary_column="counterparty", summary_fallback_column="description",
                         date_column="forecast_collection_date", value_column="expected_base",
                         value_label="Planned", date_label="Planned Date", category_label="Inflows"),
@@ -1539,7 +2521,7 @@ def build_line_level_variance(
     ], ignore_index=True)
 
     actual_lines = pd.concat([
-        aggregate_lines(actual_receivables, section="Collections", category_column=None,
+        aggregate_lines(actual_receivables, section="Collections", category_column=inflow_category_column,
                         summary_column="counterparty", summary_fallback_column="description",
                         date_column="comparison_date", value_column="comparison_amount",
                         value_label="Actual", date_label="Actual Date", category_label="Inflows"),
@@ -1641,9 +2623,9 @@ def apply_excel_number_formats(worksheet) -> None:
 def bold_totals(row: pd.Series) -> list[str]:
     line_item = str(row.get("Line Item", "")).strip()
     return [
-        "font-weight: 700;" + ("background-color: #fef2f2;" if line_item == "OD Utilization" else "")
+        "font-weight: 700;"
         if line_item in TOTAL_ROWS
-        else ("background-color: #fef2f2;" if line_item == "OD Utilization" else "")
+        else ""
         for _ in row
     ]
 
@@ -1659,6 +2641,7 @@ def apply_sort_controls(
     sortable_columns: list[str] | None = None,
     default_sort_by: str | None = None,
     default_descending: bool = False,
+    preserve_index: bool = False,
 ) -> pd.DataFrame:
     if df.empty or len(df) <= 1:
         return df
@@ -1677,10 +2660,11 @@ def apply_sort_controls(
         disabled=selected_column == default_label,
     )
     if selected_column == default_label:
-        return df.reset_index(drop=True)
-    return df.sort_values(
+        return df.copy() if preserve_index else df.reset_index(drop=True)
+    sorted_df = df.sort_values(
         by=selected_column, ascending=(selected_order == "Ascending"), na_position="last", kind="stable"
-    ).reset_index(drop=True)
+    )
+    return sorted_df if preserve_index else sorted_df.reset_index(drop=True)
 
 
 def sort_financial_matrix(
@@ -1761,6 +2745,85 @@ def render_financial_table(
     st.markdown(styler.to_html(), unsafe_allow_html=True)
 
 
+def render_weekly_financial_table(
+    weekly_cashflow: dict[str, Any],
+    selected_month: pd.Timestamp,
+    balance_as_of_date: pd.Timestamp,
+) -> None:
+    df = weekly_cashflow["weekly_table"].copy()
+    if df.empty:
+        st.info("No records available for this view.")
+        return
+
+    week_columns = set(weekly_cashflow["week_columns"])
+    week_header_map = {
+        week["key"]: f'{week["key"]}<br><span style="font-weight:400; font-size:0.82rem;">'
+        f'{compact_day_date_label(week["start"])} - {compact_day_date_label(week["end"])}</span>'
+        for week in weekly_cashflow["week_meta"]
+    }
+    outflow_categories = weekly_cashflow["plan_outflows"]["sheet_name"].dropna().astype(str).unique().tolist()
+    scope = selected_month.strftime("%Y-%m")
+    display_df = format_date_columns(df)
+    header_columns = display_df.columns.tolist()
+
+    html_rows: list[str] = [
+        '<div style="width:100%; overflow-x:auto;">',
+        '<table style="width:100%; border-collapse:collapse; font-size:0.95rem;">',
+        "<thead><tr>",
+    ]
+    for idx, column in enumerate(header_columns):
+        align = "left" if idx == 0 else "right"
+        header_label = week_header_map.get(column, html.escape(str(column)))
+        html_rows.append(
+            f'<th style="text-align:{align}; padding:8px 10px; border-bottom:1px solid #d4d4d8; white-space:nowrap;">'
+            f"{header_label}</th>"
+        )
+    html_rows.append("</tr></thead><tbody>")
+
+    for _, row in display_df.iterrows():
+        line_item = str(row["Line Item"])
+        drill_config = classify_weekly_drilldown_line_item(line_item, outflow_categories)
+        row_label = line_item.strip()
+        row_weight = "600" if row_label in TOTAL_ROWS else "400"
+        html_rows.append("<tr>")
+        for column in header_columns:
+            if column == "Line Item":
+                html_rows.append(
+                    '<td style="padding:8px 10px; border-bottom:1px solid #ececf1; text-align:left; '
+                    f'white-space:pre; font-weight:{row_weight};">{html.escape(line_item)}</td>'
+                )
+                continue
+
+            raw_value = df.loc[row.name, column]
+            formatted_value = format_currency(raw_value) if pd.notna(raw_value) else ""
+            cell_color = "#b91c1c" if pd.notna(raw_value) and float(raw_value) < 0 else "inherit"
+            cell_value_html = html.escape(formatted_value)
+
+            if column in week_columns and formatted_value and drill_config is not None:
+                drill_href = build_weekly_drilldown_href(
+                    scope,
+                    column,
+                    line_item,
+                    selected_month,
+                    balance_as_of_date,
+                )
+                cell_value_html = (
+                    f'<a href="{html.escape(drill_href)}" target="_self" '
+                    'style="color:inherit; text-decoration:none; font-weight:inherit;">'
+                    f"{html.escape(formatted_value)}</a>"
+                )
+
+            html_rows.append(
+                '<td style="padding:8px 10px; border-bottom:1px solid #ececf1; text-align:right; '
+                f'color:{cell_color}; font-weight:{row_weight};">{cell_value_html}</td>'
+            )
+        html_rows.append("</tr>")
+
+    html_rows.append("</tbody></table></div>")
+    st.markdown("".join(html_rows), unsafe_allow_html=True)
+    st.caption("Click a weekly amount cell to view the supporting line items below.")
+
+
 def render_simple_table(
     df: pd.DataFrame,
     currency_columns: list[str] | None = None,
@@ -1833,7 +2896,7 @@ def render_cash_alert_banner(
         alerts.append(("amber", f"OD HEADROOM TIGHT: Utilising {util_pct:.0f}% of sanctioned limit ({format_currency(od_utilization)} of {format_currency(od_sanctioned_limit)})."))
 
     if od_interest_est > 0:
-        alerts.append(("info", f"Estimated OD interest for this month: {format_currency(od_interest_est)} (based on {od_interest_est:.0f} drawn at configured rate)."))
+        alerts.append(("info", f"Estimated OD interest for this month: {format_currency(od_interest_est)} based on average OD outstanding at the configured rate."))
 
     for severity, message in alerts:
         colour_map = {
@@ -1885,22 +2948,23 @@ def render_kpis(
     # ── Primary KPI row ──────────────────────────────────────────────────────
     cols = st.columns(5)
     cols[0].metric("Opening Cash", format_currency(opening_balance))
-    cols[1].metric("Net Inflows (Month)", format_currency(plan["net"]))
+    cols[1].metric("Total Inflows (Month)", format_currency(plan["collections"]))
     cols[2].metric("Total Outflows (Month)", format_currency(plan["outflows"]))
     cols[3].metric("Month-End Cash (Planned)", format_currency(plan["ending"]))
     cols[4].metric("Runway", format_runway(runway_days))
 
     # ── OD / credit-line KPI row ─────────────────────────────────────────────
     od_util = plan.get("od_utilization", 0.0) or 0.0
-    if od_sanctioned_limit > 0 or od_util > 0:
-        od_headroom = max(od_sanctioned_limit - od_util, 0.0)
-        od_pct = (od_util / od_sanctioned_limit * 100) if od_sanctioned_limit > 0 else 0.0
+    opening_od = plan.get("opening_od_utilization", 0.0) or 0.0
+    if od_sanctioned_limit > 0 or od_util > 0 or opening_od > 0:
+        od_headroom = plan.get("available_od_limit", max(od_sanctioned_limit - od_util, 0.0)) or 0.0
         od_interest = plan.get("od_interest_est", 0.0) or 0.0
-        od_cols = st.columns(4)
+        od_cols = st.columns(5)
         od_cols[0].metric("OD Sanctioned Limit", format_currency(od_sanctioned_limit) if od_sanctioned_limit > 0 else "—")
-        od_cols[1].metric("OD Utilization (Est.)", format_currency(od_util))
-        od_cols[2].metric("OD Headroom", format_currency(od_headroom))
-        od_cols[3].metric("Est. OD Interest Cost", format_currency(od_interest) if od_interest > 0 else "Nil")
+        od_cols[1].metric("Opening OD Outstanding", format_currency(opening_od))
+        od_cols[2].metric("Closing OD Outstanding", format_currency(od_util))
+        od_cols[3].metric("Available OD Headroom", format_currency(od_headroom))
+        od_cols[4].metric("Est. OD Interest Cost", format_currency(od_interest) if od_interest > 0 else "Nil")
 
     # ── Decision box ─────────────────────────────────────────────────────────
     statement, actions = build_decision_box(
@@ -2319,6 +3383,260 @@ def _get_commentary(key: str) -> str:
     return st.session_state.get(f"commentary_{key}", "")
 
 
+def _excel_compatible_value(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return value
+
+
+def _build_unique_sheet_title(desired_title: str, existing_titles: list[str]) -> str:
+    cleaned = re.sub(r"[\[\]\*\?/\\:]", " ", str(desired_title or "Sheet")).strip() or "Sheet"
+    cleaned = cleaned[:31]
+    existing_lookup = {title.lower() for title in existing_titles}
+    candidate = cleaned
+    suffix = 2
+    while candidate.lower() in existing_lookup:
+        suffix_text = f" ({suffix})"
+        candidate = f"{cleaned[: max(0, 31 - len(suffix_text))]}{suffix_text}"
+        suffix += 1
+    return candidate
+
+
+def _get_header_row_index(worksheet) -> int:
+    for row_idx in range(1, worksheet.max_row + 1):
+        if any(worksheet.cell(row=row_idx, column=col_idx).value not in (None, "") for col_idx in range(1, worksheet.max_column + 1)):
+            return row_idx
+    return 1
+
+
+def _write_dataframe_to_sheet(worksheet, df: pd.DataFrame, header_row: int | None = None) -> None:
+    header_row = header_row or _get_header_row_index(worksheet)
+    max_column = max(worksheet.max_column, len(df.columns), 1)
+    for row_idx in range(header_row, worksheet.max_row + 1):
+        for col_idx in range(1, max_column + 1):
+            worksheet.cell(row=row_idx, column=col_idx).value = None
+
+    for col_idx, column_name in enumerate(df.columns, start=1):
+        worksheet.cell(row=header_row, column=col_idx).value = column_name
+
+    for row_offset, row_values in enumerate(df.itertuples(index=False, name=None), start=1):
+        for col_idx, value in enumerate(row_values, start=1):
+            worksheet.cell(row=header_row + row_offset, column=col_idx).value = _excel_compatible_value(value)
+
+    worksheet.freeze_panes = f"A{header_row + 1}"
+    _auto_column_widths(worksheet)
+
+
+def _extract_receivable_reference(description: Any, counterparty: Any) -> str:
+    description_text = str(description or "").strip()
+    counterparty_text = str(counterparty or "").strip()
+    if " | " not in description_text:
+        return ""
+    left_part, right_part = description_text.split(" | ", 1)
+    if counterparty_text and standardize_label(left_part) != standardize_label(counterparty_text):
+        return ""
+    return right_part.strip()
+
+
+def build_receivables_source_sheet(receivables_df: pd.DataFrame, sheet_meta: dict[str, Any] | None = None) -> pd.DataFrame:
+    sheet_meta = sheet_meta or {}
+    columns = list(sheet_meta.get("columns") or DEFAULT_RECEIVABLE_EXPORT_COLUMNS)
+    column_map = dict(sheet_meta.get("column_map") or detect_receivables_columns(columns))
+    if not columns or not column_map.get("amount"):
+        columns = DEFAULT_RECEIVABLE_EXPORT_COLUMNS.copy()
+        column_map = detect_receivables_columns(columns)
+
+    export_df = pd.DataFrame({column: [None] * len(receivables_df) for column in columns})
+    if receivables_df.empty:
+        return export_df
+
+    invoice_date_series = receivables_df.get("invoice_date", pd.Series(pd.NaT, index=receivables_df.index))
+    amount_series = receivables_df.get("amount", pd.Series(0.0, index=receivables_df.index))
+    counterparty_series = receivables_df.get("counterparty", pd.Series("", index=receivables_df.index))
+    description_series = receivables_df.get("description", pd.Series("", index=receivables_df.index))
+    ageing_series = receivables_df.get("ageing", pd.Series(0.0, index=receivables_df.index))
+    tentative_series = receivables_df.get("tentative_collection_date", pd.Series(pd.NaT, index=receivables_df.index))
+    due_date_series = receivables_df.get("due_date", pd.Series(pd.NaT, index=receivables_df.index))
+    billing_series = receivables_df.get("billing_type", pd.Series("", index=receivables_df.index))
+    if billing_series.fillna("").astype(str).str.strip().eq("").all():
+        billing_series = receivables_df.get("billing_bucket", pd.Series("", index=receivables_df.index))
+
+    if column_map.get("date"):
+        export_df[column_map["date"]] = pd.to_datetime(invoice_date_series, errors="coerce")
+    if column_map.get("amount"):
+        export_df[column_map["amount"]] = pd.to_numeric(amount_series, errors="coerce")
+    if column_map.get("client"):
+        export_df[column_map["client"]] = counterparty_series
+    if column_map.get("reference"):
+        export_df[column_map["reference"]] = [
+            _extract_receivable_reference(desc, party)
+            for desc, party in zip(description_series, counterparty_series)
+        ]
+    if column_map.get("ageing"):
+        export_df[column_map["ageing"]] = pd.to_numeric(ageing_series, errors="coerce")
+    if column_map.get("tentative_date"):
+        export_df[column_map["tentative_date"]] = pd.to_datetime(tentative_series, errors="coerce")
+    if column_map.get("due_date"):
+        export_df[column_map["due_date"]] = pd.to_datetime(due_date_series, errors="coerce")
+    if column_map.get("billing_type"):
+        export_df[column_map["billing_type"]] = billing_series.fillna("").astype(str)
+    return export_df
+
+
+def build_outflow_source_sheet(
+    outflow_df: pd.DataFrame,
+    sheet_meta: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    sheet_meta = sheet_meta or {}
+    columns = list(sheet_meta.get("columns") or DEFAULT_OUTFLOW_EXPORT_COLUMNS)
+    column_map = dict(sheet_meta.get("column_map") or detect_outflow_columns(columns))
+    if not columns or not column_map.get("amount") or not (column_map.get("planned_date") or column_map.get("actual_date")):
+        columns = DEFAULT_OUTFLOW_EXPORT_COLUMNS.copy()
+        column_map = detect_outflow_columns(columns)
+
+    export_df = pd.DataFrame({column: [None] * len(outflow_df) for column in columns})
+    if outflow_df.empty:
+        return export_df
+
+    date_series = outflow_df.get("date", pd.Series(pd.NaT, index=outflow_df.index))
+    amount_series = outflow_df.get("amount", pd.Series(0.0, index=outflow_df.index))
+    description_series = outflow_df.get("description", pd.Series("", index=outflow_df.index))
+    vendor_series = outflow_df.get("vendor_name", pd.Series("", index=outflow_df.index))
+    date_target = column_map.get("planned_date") or column_map.get("actual_date")
+    if date_target:
+        export_df[date_target] = pd.to_datetime(date_series, errors="coerce")
+    if column_map.get("amount"):
+        export_df[column_map["amount"]] = pd.to_numeric(amount_series, errors="coerce")
+    if column_map.get("description"):
+        export_df[column_map["description"]] = description_series.fillna("").astype(str)
+    if column_map.get("vendor"):
+        export_df[column_map["vendor"]] = vendor_series.fillna("").astype(str)
+    return export_df
+
+
+def build_reuploadable_source_export(
+    source: Any,
+    receivables_df: pd.DataFrame,
+    outflows_df: pd.DataFrame,
+    workbook_layout: dict[str, Any] | None = None,
+) -> bytes:
+    workbook_layout = workbook_layout or {}
+    sheet_meta_map = workbook_layout.get("sheet_meta", {})
+
+    reset_source_pointer(source)
+    workbook = load_workbook(source)
+    reset_source_pointer(source)
+    receivables_export_df = receivables_df.copy()
+
+    existing_inflow_sheets = workbook_layout.get("inflow_sheet_names", [])
+    inflow_sheet_lookup = {
+        standardize_label(sheet_name): sheet_name
+        for sheet_name in existing_inflow_sheets
+        if str(sheet_name).strip()
+    }
+    fallback_inflow_sheet_name = existing_inflow_sheets[0] if existing_inflow_sheets else "Receivables"
+    if not receivables_export_df.empty:
+        if "source_sheet" not in receivables_export_df.columns:
+            receivables_export_df["source_sheet"] = fallback_inflow_sheet_name
+        else:
+            receivables_export_df["source_sheet"] = (
+                receivables_export_df["source_sheet"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .replace("", fallback_inflow_sheet_name)
+            )
+
+    def inflow_rows_for(sheet_name: str) -> pd.DataFrame:
+        if receivables_export_df.empty:
+            return receivables_export_df.iloc[0:0].copy()
+        if "source_sheet" not in receivables_export_df.columns:
+            return receivables_export_df.reset_index(drop=True)
+        return receivables_export_df.loc[
+            receivables_export_df["source_sheet"].fillna("").astype(str).map(standardize_label) == standardize_label(sheet_name)
+        ].reset_index(drop=True)
+
+    for sheet_name in existing_inflow_sheets:
+        if sheet_name not in workbook.sheetnames:
+            workbook.create_sheet(sheet_name)
+        worksheet = workbook[sheet_name]
+        receivables_export = build_receivables_source_sheet(
+            inflow_rows_for(sheet_name),
+            sheet_meta=sheet_meta_map.get(sheet_name),
+        )
+        _write_dataframe_to_sheet(worksheet, receivables_export)
+
+    if receivables_export_df.empty:
+        additional_inflow_sheets: list[str] = []
+    else:
+        additional_inflow_sheets = [
+            sheet_name
+            for sheet_name in order_sheet_names(receivables_export_df.get("source_sheet", pd.Series(dtype="object")).dropna().astype(str).tolist())
+            if standardize_label(sheet_name) not in inflow_sheet_lookup
+        ]
+
+    seen_new_inflow_sheets: set[str] = set()
+    for sheet_name in additional_inflow_sheets:
+        sheet_key = standardize_label(sheet_name)
+        if not sheet_key or sheet_key in seen_new_inflow_sheets:
+            continue
+        seen_new_inflow_sheets.add(sheet_key)
+        worksheet = workbook.create_sheet(_build_unique_sheet_title(sheet_name, workbook.sheetnames))
+        receivables_export = build_receivables_source_sheet(inflow_rows_for(sheet_name))
+        _write_dataframe_to_sheet(worksheet, receivables_export)
+
+    existing_outflow_sheets = workbook_layout.get("outflow_sheet_names", [])
+    existing_outflow_lookup = {
+        standardize_label(sheet_name): sheet_name
+        for sheet_name in existing_outflow_sheets
+        if str(sheet_name).strip()
+    }
+
+    def outflow_rows_for(sheet_name: str) -> pd.DataFrame:
+        if outflows_df.empty:
+            return outflows_df.iloc[0:0].copy()
+        return outflows_df.loc[
+            outflows_df["sheet_name"].fillna("").astype(str).map(standardize_label) == standardize_label(sheet_name)
+        ].reset_index(drop=True)
+
+    for sheet_name in existing_outflow_sheets:
+        if sheet_name not in workbook.sheetnames:
+            workbook.create_sheet(sheet_name)
+        worksheet = workbook[sheet_name]
+        export_df = build_outflow_source_sheet(
+            outflow_rows_for(sheet_name),
+            sheet_meta=sheet_meta_map.get(sheet_name),
+        )
+        _write_dataframe_to_sheet(worksheet, export_df)
+
+    if outflows_df.empty:
+        additional_categories: list[str] = []
+    else:
+        additional_categories = [
+            category
+            for category in order_outflow_sheets(outflows_df["sheet_name"].dropna().astype(str).tolist())
+            if standardize_label(category) not in existing_outflow_lookup
+        ]
+
+    seen_new_categories: set[str] = set()
+    for category in additional_categories:
+        category_key = standardize_label(category)
+        if not category_key or category_key in seen_new_categories:
+            continue
+        seen_new_categories.add(category_key)
+        sheet_title = _build_unique_sheet_title(category, workbook.sheetnames)
+        worksheet = workbook.create_sheet(sheet_title)
+        export_df = build_outflow_source_sheet(outflow_rows_for(category))
+        _write_dataframe_to_sheet(worksheet, export_df)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
 def build_weekly_breakdown_export(
     weekly_cashflow: dict[str, Any],
     selected_month: pd.Timestamp,
@@ -2363,42 +3681,12 @@ def build_weekly_breakdown_export(
 
 def build_week_raw_export(week: dict[str, Any]) -> bytes:
     output = BytesIO()
-    inflows = round_numeric_columns(
-        week["plan_receipts_detail"].copy(),
-        percent_columns=["base_probability", "best_probability", "worst_probability"],
-    )
-    outflows = round_numeric_columns(week["plan_outflows_detail"].copy())
+    inflows = prepare_inflow_line_item_table(week["plan_receipts_detail"])
+    outflows = prepare_outflow_line_item_table(week["plan_outflows_detail"])
     inflow_summary = round_numeric_columns(
         summarize_inflow_detail(week["plan_receipts_detail"], value_column="expected_base", value_label="Expected Collection")
     )
     outflow_summary = round_numeric_columns(summarize_outflow_detail(week["plan_outflows_detail"]))
-
-    if inflows.empty:
-        inflows = pd.DataFrame(columns=["counterparty", "description", "billing_type", "billing_bucket",
-                                        "due_date", "aging_bucket", "base_probability", "expected_base", "forecast_collection_date"])
-    else:
-        keep_cols = ["invoice_date", "tentative_collection_date", "forecast_collection_date", "due_date",
-                     "billing_type", "billing_bucket", "counterparty", "description", "amount", "aging_bucket",
-                     "base_probability", "best_probability", "worst_probability",
-                     "expected_base", "expected_best", "expected_worst"]
-        inflows = inflows[[c for c in keep_cols if c in inflows.columns]].rename(columns={
-            "invoice_date": "Invoice Date", "tentative_collection_date": "Tentative Collection Date",
-            "forecast_collection_date": "Forecast Collection Date", "due_date": "Due Date",
-            "billing_type": "Billing Type", "billing_bucket": "Billing Bucket",
-            "counterparty": "Client", "description": "Reference", "amount": "Invoice Amount",
-            "aging_bucket": "Aging Bucket", "base_probability": "Base Probability",
-            "best_probability": "Best Probability", "worst_probability": "Worst Probability",
-            "expected_base": "Expected Base Collection", "expected_best": "Expected Best Collection",
-            "expected_worst": "Expected Worst Collection",
-        })
-
-    if outflows.empty:
-        outflows = pd.DataFrame(columns=["sheet_name", "vendor_name", "description", "date", "amount"])
-    else:
-        outflows = outflows[["sheet_name", "vendor_name", "description", "date", "amount"]].rename(columns={
-            "sheet_name": "Category", "vendor_name": "Vendor",
-            "description": "Particular", "date": "Payment Date", "amount": "Amount",
-        })
 
     holiday_rows = [
         {"Week": week["key"], "Week Range": week["label"],
@@ -2654,7 +3942,7 @@ def render_upload_prompt() -> None:
         f"""
         <div class="app-banner">
             <div class="app-banner-title">Planned workbook required</div>
-            <div class="app-banner-subtitle">The app runs only on the workbook uploaded for the day.</div>
+            <div class="app-banner-subtitle">The app runs only on the workbook uploaded for the day. You can add or remove outflow sheets as needed, as long as the key headers stay recognizable.</div>
             <div style="margin-top:14px; font-size:0.94rem;">
                 <strong>Expected format reference</strong>
                 <ul style="margin-top:8px;">{sheet_list}</ul>
@@ -2672,7 +3960,9 @@ def render_upload_prompt() -> None:
 def handle_planned_upload_change() -> None:
     uploaded = st.session_state.get("planned_uploader_widget")
     st.session_state["planned_workbook_file"] = uploaded
-    st.session_state["planned_load_time"] = datetime.now().strftime("%d-%m-%Y %H:%M:%S") if uploaded else None
+    load_time = datetime.now().strftime("%d-%m-%Y %H:%M:%S") if uploaded else None
+    st.session_state["planned_load_time"] = load_time
+    persist_uploaded_file("planned", uploaded, load_time=load_time)
     st.session_state.pop("selected_forecast_month", None)
     # Clear any in-app edits so fresh data seeds from the new file
     st.session_state.pop("_edit_source_hash", None)
@@ -2683,6 +3973,7 @@ def handle_planned_upload_change() -> None:
 def handle_actual_upload_change() -> None:
     uploaded = st.session_state.get("actual_uploader_widget")
     st.session_state["actual_workbook_file"] = uploaded
+    persist_uploaded_file("actual", uploaded)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2692,6 +3983,19 @@ def handle_actual_upload_change() -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="expanded")
     inject_styles()
+    navigation_options = [
+        "Executive Summary",
+        "Group Cashflow",
+        "Collection Engine",
+        "3-Month Cash Flow View",
+        "Actual vs Budget",
+        "✏️ Edit Data",
+    ]
+    requested_view = get_requested_view(
+        GROUP_CASHFLOW_VIEW if has_weekly_drilldown_query() else DEFAULT_NAV_VIEW
+    )
+    if requested_view in navigation_options and "selected_view" not in st.session_state:
+        st.session_state["selected_view"] = requested_view
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -2701,8 +4005,9 @@ def main() -> None:
         st.markdown("**Navigation**")
         selected_view = st.radio(
             "Select Section",
-            ["Executive Summary", "Group Cashflow", "Collection Engine", "3-Month Cash Flow View", "Actual vs Budget", "✏️ Edit Data"],
+            navigation_options,
             label_visibility="collapsed",
+            key="selected_view",
         )
         st.markdown("---")
 
@@ -2720,6 +4025,13 @@ def main() -> None:
 
     # ── Load planned data ────────────────────────────────────────────────────
     planned_upload = st.session_state.get("planned_workbook_file", st.session_state.get("planned_uploader_widget"))
+    if planned_upload is None and has_weekly_drilldown_query():
+        cached_planned, planned_meta = load_cached_upload("planned")
+        if cached_planned is not None:
+            planned_upload = cached_planned
+            st.session_state["planned_workbook_file"] = cached_planned
+            if planned_meta.get("load_time"):
+                st.session_state["planned_load_time"] = planned_meta["load_time"]
     if planned_upload is None:
         render_upload_prompt()
         return
@@ -2738,8 +4050,22 @@ def main() -> None:
     _current_hash = file_md5(planned_upload)
     if st.session_state.get("_edit_source_hash") != _current_hash:
         st.session_state["_edit_source_hash"] = _current_hash
-        st.session_state["edited_receivables"] = plan_data["receivables"].copy()
-        st.session_state["edited_outflows"] = plan_data["outflows"].copy()
+        initialize_edit_history("receivables", plan_data["receivables"])
+        initialize_edit_history("outflows", plan_data["outflows"])
+    else:
+        for dataset_key, fallback_df in (
+            ("receivables", plan_data["receivables"]),
+            ("outflows", plan_data["outflows"]),
+        ):
+            if (
+                _edit_history_key(dataset_key) not in st.session_state
+                or _edit_history_index_key(dataset_key) not in st.session_state
+                or _edit_history_log_key(dataset_key) not in st.session_state
+            ):
+                initialize_edit_history(
+                    dataset_key,
+                    st.session_state.get(_edit_state_key(dataset_key), fallback_df).copy(),
+                )
 
     # Keep original Excel data available (used for reset in Edit Data section)
     _excel_receivables = plan_data["receivables"].copy()
@@ -2772,6 +4098,15 @@ def main() -> None:
             st.caption("Upload an actual workbook to enable variance tracking.")
 
         st.markdown("**Forecast Settings**")
+        requested_forecast_month = get_query_params().get(FORECAST_MONTH_QUERY_KEY, "").strip()
+        if requested_forecast_month and st.session_state.get("selected_forecast_month") is None:
+            requested_month_start = build_month_start(requested_forecast_month)
+            matched_month = next(
+                (month for month in available_months if build_month_start(month) == requested_month_start),
+                None,
+            )
+            if matched_month is not None:
+                st.session_state["selected_forecast_month"] = matched_month
         selected_month = st.selectbox(
             "Forecast Month",
             options=available_months,
@@ -2779,6 +4114,7 @@ def main() -> None:
             index=default_month_index(available_months),
             key="selected_forecast_month",
         )
+        sync_forecast_month_query_param(selected_month)
         current_bank_balance = st.number_input(
             "Current Bank Balance (₹)", min_value=0.0, value=5_000_000.0,
             step=100_000.0, format="%.0f",
@@ -2791,6 +4127,13 @@ def main() -> None:
         month_start = build_month_start(selected_month)
         month_end = build_month_end(selected_month)
         balance_date_key = "bank_balance_as_of_date"
+        requested_balance_date = get_query_params().get(BALANCE_DATE_QUERY_KEY, "").strip()
+        if requested_balance_date:
+            requested_balance_ts = pd.Timestamp(requested_balance_date).normalize()
+            if month_start <= requested_balance_ts <= month_end:
+                requested_balance_value = requested_balance_ts.date()
+                if st.session_state.get(balance_date_key) != requested_balance_value:
+                    st.session_state[balance_date_key] = requested_balance_value
         stored = st.session_state.get(balance_date_key)
         if stored is None:
             st.session_state[balance_date_key] = default_balance_as_of_date(selected_month).date()
@@ -2851,11 +4194,25 @@ def main() -> None:
             value=DEFAULT_OD_LIMIT, step=500_000.0, format="%.0f",
             help="Total sanctioned overdraft / cash credit limit. Set to 0 if no OD facility.",
         )
+        opening_od_utilization = st.number_input(
+            "Opening OD Utilization (₹)", min_value=0.0,
+            value=DEFAULT_OPENING_OD_UTILIZATION, step=100_000.0, format="%.0f",
+            help="Outstanding OD already utilised as of the opening balance date.",
+        )
         od_rate_pa = st.number_input(
             "OD Interest Rate (% p.a.)", min_value=0.0, max_value=50.0,
             value=DEFAULT_OD_RATE_PA, step=0.25, format="%.2f",
             help="Annual interest rate on OD drawn. Used to estimate monthly interest cost.",
         )
+        opening_od_headroom = (
+            max(od_sanctioned_limit - opening_od_utilization, 0.0)
+            if od_sanctioned_limit > 0
+            else 0.0
+        )
+        if od_sanctioned_limit > 0 and opening_od_utilization > od_sanctioned_limit:
+            st.warning("Opening OD utilization exceeds the sanctioned limit. Additional OD drawdown will be blocked until headroom is restored.")
+        st.caption(f"Available OD headroom at start: {format_currency(opening_od_headroom)}")
+        st.caption(f"Weekly surplus above the minimum cash floor of {format_currency(min_cash_threshold)} is used to repay OD.")
         st.markdown("---")
 
         # ── Model Context ─────────────────────────────────────────────────────
@@ -2869,6 +4226,11 @@ def main() -> None:
 
     # ── Load actual data ────────────────────────────────────────────────────
     actual_upload = st.session_state.get("actual_workbook_file", st.session_state.get("actual_uploader_widget"))
+    if actual_upload is None and has_weekly_drilldown_query():
+        cached_actual, _actual_meta = load_cached_upload("actual")
+        if cached_actual is not None:
+            actual_upload = cached_actual
+            st.session_state["actual_workbook_file"] = cached_actual
     actual_data = None
     if actual_upload is not None:
         try:
@@ -2890,6 +4252,8 @@ def main() -> None:
         tds_rate=tds_rate,
         od_sanctioned_limit=od_sanctioned_limit,
         od_interest_rate_pa=od_rate_pa,
+        opening_od_utilization=opening_od_utilization,
+        od_buffer_balance=min_cash_threshold,
     )
 
     next_30_end = balance_as_of_date + pd.Timedelta(days=29)
@@ -2931,7 +4295,7 @@ def main() -> None:
     if selected_view == "Executive Summary":
         render_section_header(
             "Section 1: Executive Summary",
-            "Month view of opening cash, net inflows, outflows, month-end balance, and liquidity runway.",
+            "Month view of opening cash, total inflows, outflows, month-end balance, and liquidity runway.",
         )
         render_kpis(
             current_bank_balance,
@@ -2952,6 +4316,10 @@ def main() -> None:
             "Section 2: Group Cashflow",
             "Weekly breakdown for the selected month with monthly forecast and actual columns.",
         )
+        st.markdown('<div id="weekly-drilldown-target"></div>', unsafe_allow_html=True)
+        if resolve_weekly_drilldown_selection(weekly_results, selected_month) is not None:
+            render_weekly_drilldown_selection(weekly_results, selected_month)
+            st.markdown("---")
         notes_col, dl_col, raw_col = st.columns([3, 1, 1])
         with notes_col:
             week_notes = " | ".join(w["label"] for w in weekly_results["week_meta"])
@@ -2974,8 +4342,9 @@ def main() -> None:
                 use_container_width=True,
             )
         render_week_holiday_summary(weekly_results["week_meta"])
-        financial_columns = weekly_results["week_columns"] + ["Fcst (Selected Month)", "Actual (if available)"]
-        render_financial_table(weekly_results["weekly_table"], numeric_columns=financial_columns)
+        render_weekly_financial_table(weekly_results, selected_month, balance_as_of_date)
+        if resolve_weekly_drilldown_selection(weekly_results, selected_month) is None:
+            render_weekly_drilldown_selection(weekly_results, selected_month)
         render_weekly_drilldown(weekly_results["week_meta"])
 
     # ══ SECTION 3: Collection Engine ═════════════════════════════════════════
@@ -3017,40 +4386,88 @@ def main() -> None:
 
     # ══ SECTION 6: Edit Data ═════════════════════════════════════════════════
     if selected_view == "✏️ Edit Data":
+        _edit_window_start = weekly_results.get("selected_period_start", weekly_results["selected_month_start"])
+        _edit_window_end = weekly_results["selected_month_end"]
+        _edit_window_label = (
+            f"Showing only rows relevant to the {month_label(selected_month)} cash flow window: "
+            f"{format_date(_edit_window_start)} to {format_date(_edit_window_end)}."
+        )
         render_section_header(
             "Edit Data — Live Override",
             "Edit receivable lines or outflow entries directly. Every change is reflected immediately "
-            "in all other sections without re-uploading Excel.",
+            "in all other sections without re-uploading Excel. Track Changes keeps a separate undo/redo trail "
+            "for inflows and outflows once edits are applied.",
         )
 
         _edit_badge = (
             "🟡 Working on edited data — edits active"
             if (
-                not st.session_state["edited_receivables"].equals(_excel_receivables)
-                or not st.session_state["edited_outflows"].equals(_excel_outflows)
+                not edit_frames_equal(st.session_state["edited_receivables"], _excel_receivables)
+                or not edit_frames_equal(st.session_state["edited_outflows"], _excel_outflows)
             )
             else "🟢 Data matches the uploaded Excel"
         )
         st.caption(_edit_badge)
+        try:
+            reviewed_source_bytes = build_reuploadable_source_export(
+                planned_upload,
+                st.session_state["edited_receivables"],
+                st.session_state["edited_outflows"],
+                plan_data.get("workbook_layout"),
+            )
+        except Exception as exc:
+            reviewed_source_bytes = None
+            st.warning(f"Reviewed source export is unavailable right now: {exc}")
 
-        tab_recv, tab_out = st.tabs(["📥 Receivables", "📤 Outflows"])
+        if reviewed_source_bytes is not None:
+            reviewed_file_name = f"{Path(planned_upload.name).stem}_reviewed_source.xlsx"
+            st.download_button(
+                "Download Reviewed Source (Excel)",
+                data=reviewed_source_bytes,
+                file_name=reviewed_file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Exports the current reviewed data back into upload-compatible sheet tabs so you can re-upload it later.",
+            )
+
+        tab_recv, tab_out = st.tabs(["📥 Inflows", "📤 Outflows"])
 
         # ── Tab 1: Receivables ────────────────────────────────────────────────
         with tab_recv:
+            _recv_full_df = st.session_state["edited_receivables"].copy()
+            _recv_forecast_view = derive_collection_probabilities(
+                _recv_full_df,
+                anchor_date=balance_as_of_date,
+                base_probs=user_base_probs,
+                worst_probs=user_worst_probs,
+                tds_rate=tds_rate,
+            )
+            _recv_visible_mask = pd.to_datetime(
+                _recv_forecast_view["forecast_collection_date"], errors="coerce"
+            ).between(_edit_window_start, _edit_window_end, inclusive="both")
+            _recv_visible_df = _recv_full_df.loc[_recv_visible_mask].copy()
+            _recv_hidden_df = _recv_full_df.loc[~_recv_visible_mask].copy()
             st.markdown(
-                f"**{len(st.session_state['edited_receivables'])} receivable lines.** "
+                f"**{len(_recv_visible_df)} receivable lines shown for {month_label(selected_month)}.** "
                 "Edit amounts, dates, aging buckets or billing types. "
                 "Add rows with ➕ or delete with the checkbox. "
                 "Click **Apply** to commit changes."
             )
+            st.caption(_edit_window_label)
             recv_display_cols = [
                 "counterparty", "invoice_date", "tentative_collection_date",
                 "due_date", "amount", "ageing", "aging_bucket", "billing_bucket",
             ]
             recv_edit_df = (
-                st.session_state["edited_receivables"]
+                _recv_visible_df
                 .reindex(columns=recv_display_cols)
                 .copy()
+            )
+            recv_edit_df.index = _recv_visible_df.index
+            recv_edit_df = apply_sort_controls(
+                recv_edit_df,
+                key_prefix="edit_receivables",
+                sortable_columns=recv_display_cols,
+                preserve_index=True,
             )
             # Ensure date columns are proper Python date for the editor
             for _dc in ["invoice_date", "tentative_collection_date", "due_date"]:
@@ -3061,6 +4478,7 @@ def main() -> None:
                 key="recv_data_editor",
                 num_rows="dynamic",
                 use_container_width=True,
+                hide_index=True,
                 column_config={
                     "counterparty": st.column_config.TextColumn(
                         "Client / Party", help="Customer or counterparty name"
@@ -3086,7 +4504,7 @@ def main() -> None:
                         "Aging Bucket", options=["0-30", "30-60", "60+"]
                     ),
                     "billing_bucket": st.column_config.SelectboxColumn(
-                        "Billing Type", options=["Advance", "Arrear"]
+                        "Billing Type", options=["Advance", "Receivables"]
                     ),
                 },
             )
@@ -3104,41 +4522,87 @@ def main() -> None:
                     _new_recv["aging_bucket"] = _new_recv["aging_bucket"].fillna(
                         _new_recv["ageing"].apply(classify_aging_bucket)
                     )
-                    _new_recv["billing_bucket"] = _new_recv["billing_bucket"].fillna("Arrear")
+                    _new_recv["billing_bucket"] = _new_recv["billing_bucket"].fillna("Receivables")
+                    _new_recv["billing_bucket"] = _new_recv["billing_bucket"].map(normalize_billing_bucket)
                     # Rebuild description column to stay in sync
                     _new_recv["description"] = _new_recv["counterparty"]
                     # Drop zero-amount rows
-                    _new_recv = _new_recv[_new_recv["amount"] != 0].reset_index(drop=True)
-                    # Restore any columns that existed in original but are not editable here
-                    _orig_cols = [c for c in st.session_state["edited_receivables"].columns
-                                  if c not in recv_display_cols]
+                    _new_recv = _new_recv[_new_recv["amount"] != 0].copy()
+                    # Restore non-editable columns for rows that remain visible after edits.
+                    _hidden_cols = [
+                        c for c in _recv_full_df.columns
+                        if c not in recv_display_cols and c not in _new_recv.columns
+                    ]
+                    if _hidden_cols:
+                        _existing_hidden = _recv_visible_df.reindex(columns=_hidden_cols)
+                        _new_recv = _new_recv.join(_existing_hidden, how="left")
+                    _orig_cols = [
+                        c for c in _recv_full_df.columns
+                        if c not in recv_display_cols
+                    ]
                     for _oc in _orig_cols:
-                        _new_recv[_oc] = None
-                    st.session_state["edited_receivables"] = _new_recv
-                    st.success(f"✅ Receivables updated — {len(_new_recv)} lines active. All sections now reflect your changes.")
-                    st.rerun()
+                        if _oc not in _new_recv.columns:
+                            _new_recv[_oc] = None
+                    if "source_sheet" in _new_recv.columns:
+                        _default_inflow_sheet = plan_data.get("inflow_sheet_order", [None])[0] or "Receivables"
+                        _new_recv["source_sheet"] = (
+                            _new_recv["source_sheet"]
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                            .replace("", _default_inflow_sheet)
+                        )
+                    _new_recv = _new_recv.reindex(columns=_recv_full_df.columns, fill_value=None)
+                    _final_recv = pd.concat([_recv_hidden_df, _new_recv], axis=0, sort=False)
+                    _final_recv = _final_recv.sort_index(kind="stable").reset_index(drop=True)
+                    _result = commit_edit_history("receivables", _final_recv, "Applied inflow changes")
+                    if _result["changed"]:
+                        st.success(
+                            f"✅ Receivables updated — {len(_new_recv)} lines active. "
+                            f"Tracked change: {_result['summary']}."
+                        )
+                        st.rerun()
+                    st.info("No receivable changes detected to apply.")
             with _rc2:
                 if st.button("🔄 Reset to Excel", use_container_width=True):
-                    st.session_state["edited_receivables"] = _excel_receivables.copy()
-                    st.success("Receivables reset to original Excel data.")
-                    st.rerun()
+                    _result = commit_edit_history("receivables", _excel_receivables.copy(), "Reset inflows to Excel")
+                    if _result["changed"]:
+                        st.success("Receivables reset to original Excel data.")
+                        st.rerun()
+                    st.info("Receivables already match the uploaded Excel.")
             with _rc3:
                 # Quick stats
-                _total_recv = st.session_state["edited_receivables"]["amount"].sum()
+                _total_recv = _recv_visible_df["amount"].sum() if not _recv_visible_df.empty else 0.0
                 st.metric("Total Receivables (₹)", format_currency(_total_recv))
+
+            render_track_changes_panel("receivables")
 
         # ── Tab 2: Outflows ───────────────────────────────────────────────────
         with tab_out:
+            _out_full_df = st.session_state["edited_outflows"].copy()
+            _out_visible_mask = pd.to_datetime(
+                _out_full_df["date"], errors="coerce"
+            ).between(_edit_window_start, _edit_window_end, inclusive="both")
+            _out_visible_df = _out_full_df.loc[_out_visible_mask].copy()
+            _out_hidden_df = _out_full_df.loc[~_out_visible_mask].copy()
             st.markdown(
-                f"**{len(st.session_state['edited_outflows'])} outflow entries.** "
+                f"**{len(_out_visible_df)} outflow entries shown for {month_label(selected_month)}.** "
                 "Edit amounts, dates, categories or add new rows. "
                 "Click **Apply** to commit changes."
             )
+            st.caption(_edit_window_label)
             out_display_cols = ["sheet_name", "date", "vendor_name", "description", "amount"]
             out_edit_df = (
-                st.session_state["edited_outflows"]
+                _out_visible_df
                 .reindex(columns=out_display_cols)
                 .copy()
+            )
+            out_edit_df.index = _out_visible_df.index
+            out_edit_df = apply_sort_controls(
+                out_edit_df,
+                key_prefix="edit_outflows",
+                sortable_columns=out_display_cols,
+                preserve_index=True,
             )
             out_edit_df["date"] = pd.to_datetime(out_edit_df["date"], errors="coerce").dt.date
 
@@ -3153,6 +4617,7 @@ def main() -> None:
                 key="out_data_editor",
                 num_rows="dynamic",
                 use_container_width=True,
+                hide_index=True,
                 column_config={
                     "sheet_name": st.column_config.SelectboxColumn(
                         "Category",
@@ -3186,22 +4651,38 @@ def main() -> None:
                     # Drop rows without date or amount
                     _new_out = _new_out[
                         _new_out["date"].notna() & (_new_out["amount"] != 0)
-                    ].reset_index(drop=True)
-                    st.session_state["edited_outflows"] = _new_out
-                    st.success(f"✅ Outflows updated — {len(_new_out)} entries active. All sections now reflect your changes.")
-                    st.rerun()
+                    ].copy()
+                    _new_out = _new_out.reindex(columns=_out_full_df.columns, fill_value=None)
+                    _final_out = pd.concat([_out_hidden_df, _new_out], axis=0, sort=False)
+                    _final_out = _final_out.sort_index(kind="stable").reset_index(drop=True)
+                    _result = commit_edit_history("outflows", _final_out, "Applied outflow changes")
+                    if _result["changed"]:
+                        st.success(
+                            f"✅ Outflows updated — {len(_new_out)} entries active. "
+                            f"Tracked change: {_result['summary']}."
+                        )
+                        st.rerun()
+                    st.info("No outflow changes detected to apply.")
             with _oc2:
                 if st.button("🔄 Reset to Excel ", use_container_width=True):
-                    st.session_state["edited_outflows"] = _excel_outflows.copy()
-                    st.success("Outflows reset to original Excel data.")
-                    st.rerun()
+                    _result = commit_edit_history("outflows", _excel_outflows.copy(), "Reset outflows to Excel")
+                    if _result["changed"]:
+                        st.success("Outflows reset to original Excel data.")
+                        st.rerun()
+                    st.info("Outflows already match the uploaded Excel.")
             with _oc3:
-                _total_out = st.session_state["edited_outflows"]["amount"].sum()
+                _total_out = _out_visible_df["amount"].sum() if not _out_visible_df.empty else 0.0
                 st.metric("Total Outflows (₹)", format_currency(_total_out))
+
+            render_track_changes_panel("outflows")
 
         st.markdown("---")
         st.markdown("#### Live Data Summary (post-edit)")
-        _sum_c1, _sum_c2, _sum_c3 = st.columns(3)
+        _plan_summary = weekly_results["selected_month_plan"]
+        _ending_excl_od = _plan_summary.get("ending_excl_od", (_plan_summary.get("ending", 0.0) or 0.0))
+        _od_utilization = _plan_summary.get("od_utilization", 0.0) or 0.0
+
+        _sum_c1, _sum_c2, _sum_c3, _sum_c4 = st.columns(4)
         with _sum_c1:
             st.metric(
                 "Receivable lines",
@@ -3215,11 +4696,16 @@ def main() -> None:
                 delta=len(st.session_state["edited_outflows"]) - len(_excel_outflows) or None,
             )
         with _sum_c3:
-            _net_chg = (
-                st.session_state["edited_receivables"]["amount"].sum()
-                - st.session_state["edited_outflows"]["amount"].sum()
+            st.metric(
+                "Ending Balance Excl. OD (₹)",
+                format_currency(_ending_excl_od),
             )
-            st.metric("Net Position (₹)", format_currency(_net_chg))
+        with _sum_c4:
+            st.metric(
+                "OD Utilization (₹)",
+                format_currency(_od_utilization),
+                delta=None if _od_utilization > 0 else "No OD",
+            )
 
 
 if __name__ == "__main__":
