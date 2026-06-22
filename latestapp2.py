@@ -28,14 +28,37 @@ from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook
-from openpyxl.utils import column_index_from_string, get_column_letter
+try:
+    from openpyxl import load_workbook
+    from openpyxl.utils import column_index_from_string, get_column_letter
+    OPENPYXL_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    load_workbook = None
+    column_index_from_string = None
+    get_column_letter = None
+    OPENPYXL_IMPORT_ERROR = exc
 
 
 APP_TITLE = "Cash Flow Manager"
 DEFAULT_SOURCE = Path(__file__).with_name("Data Source.xlsx")
 TODAY = pd.Timestamp(date.today()).normalize()
 DATE_DISPLAY_FORMAT = "%d-%m-%Y"
+
+
+def ensure_openpyxl_available() -> None:
+    if OPENPYXL_IMPORT_ERROR is None:
+        return
+
+    st.error(
+        "This deployment is missing the `openpyxl` package, which is required "
+        "to read and export Excel workbooks."
+    )
+    st.info(
+        "In Streamlit Cloud, confirm that `requirements.txt` is committed in the "
+        "repo root, then reboot or redeploy the app so dependencies reinstall."
+    )
+    st.code("pip install openpyxl", language="bash")
+    st.stop()
 
 # ── Default collection probabilities (overridden via sidebar sliders) ─────────
 DEFAULT_BASE_COLLECTION_PROBABILITIES: dict[str, float] = {
@@ -3982,6 +4005,7 @@ def handle_actual_upload_change() -> None:
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="expanded")
+    ensure_openpyxl_available()
     inject_styles()
     navigation_options = [
         "Executive Summary",
