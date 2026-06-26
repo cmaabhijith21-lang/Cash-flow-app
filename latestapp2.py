@@ -2615,6 +2615,14 @@ def negative_red(value: Any) -> str:
     return "color: #b91c1c;" if float(value) < 0 else ""
 
 
+def apply_cell_style_map(styler: Any, func: Any, *, subset: Any = None) -> Any:
+    """Use the supported Styler cell-mapping API across pandas versions."""
+    styler_map = getattr(styler, "map", None)
+    if callable(styler_map):
+        return styler_map(func, subset=subset)
+    return styler.applymap(func, subset=subset)
+
+
 def round_numeric_columns(df: pd.DataFrame, percent_columns: list[str] | None = None) -> pd.DataFrame:
     rounded = df.copy()
     percent_set = set(percent_columns or [])
@@ -2751,20 +2759,18 @@ def render_financial_table(
             sortable_columns=sortable_columns, preserve_total_rows=preserve_total_rows,
         )
     display_df = format_date_columns(display_df)
-    styler = (
-        display_df.style.hide(axis="index")
-        .format({col: format_currency for col in numeric_columns}, na_rep="")
-        .apply(bold_totals, axis=1)
-        .applymap(negative_red, subset=numeric_columns)
-        .set_properties(subset=["Line Item"], **{"text-align": "left", "white-space": "pre"})
-        .set_properties(subset=numeric_columns, **{"text-align": "right"})
-        .set_table_styles([
-            {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
-            {"selector": "th", "props": [("text-align", "right"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
-            {"selector": "th.col_heading.level0.col0", "props": [("text-align", "left")]},
-            {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
-        ])
-    )
+    styler = display_df.style.hide(axis="index")
+    styler = styler.format({col: format_currency for col in numeric_columns}, na_rep="")
+    styler = styler.apply(bold_totals, axis=1)
+    styler = apply_cell_style_map(styler, negative_red, subset=numeric_columns)
+    styler = styler.set_properties(subset=["Line Item"], **{"text-align": "left", "white-space": "pre"})
+    styler = styler.set_properties(subset=numeric_columns, **{"text-align": "right"})
+    styler = styler.set_table_styles([
+        {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
+        {"selector": "th", "props": [("text-align", "right"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
+        {"selector": "th.col_heading.level0.col0", "props": [("text-align", "left")]},
+        {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
+    ])
     st.markdown(styler.to_html(), unsafe_allow_html=True)
 
 
@@ -2874,7 +2880,7 @@ def render_simple_table(
     formatters: dict[str, Any] = {}
     if currency_columns:
         formatters.update({col: format_currency for col in currency_columns})
-        styler = styler.applymap(negative_red, subset=currency_columns)
+        styler = apply_cell_style_map(styler, negative_red, subset=currency_columns)
     if percent_columns:
         formatters.update({col: format_percent for col in percent_columns})
     if formatters:
@@ -3112,22 +3118,20 @@ def render_six_month_view(
             return [base + "color: #92400e;" for _ in row]
         return ["" for _ in row]
 
-    styler = (
-        display.style.hide(axis="index")
-        .format({
-            "Opening Cash": format_currency,
-            "Inflows": format_currency,
-            "Outflows": format_currency,
-            "Closing Cash": format_currency,
-        }, na_rep="")
-        .applymap(negative_red, subset=["Closing Cash"])
-        .apply(style_closing_row, axis=1)
-        .set_table_styles([
-            {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
-            {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
-            {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
-        ])
-    )
+    styler = display.style.hide(axis="index")
+    styler = styler.format({
+        "Opening Cash": format_currency,
+        "Inflows": format_currency,
+        "Outflows": format_currency,
+        "Closing Cash": format_currency,
+    }, na_rep="")
+    styler = apply_cell_style_map(styler, negative_red, subset=["Closing Cash"])
+    styler = styler.apply(style_closing_row, axis=1)
+    styler = styler.set_table_styles([
+        {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
+        {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
+        {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
+    ])
     st.markdown(styler.to_html(), unsafe_allow_html=True)
 
     if min_cash_threshold > 0:
@@ -3197,25 +3201,26 @@ def render_actual_vs_budget(
             )
             major_deviation_mask = comparison["Variance %"].fillna(0) > 0.10
             cash_impact = comparison.loc[comparison["Line Item"] == "Ending Cash Balance", "Variance"].sum()
-            styler = (
-                comparison.style.hide(axis="index")
-                .format({"Planned": format_currency, "Actual": format_currency, "Variance": format_currency, "Variance %": format_percent}, na_rep="")
-                .applymap(negative_red, subset=["Variance"])
-                .apply(
-                    lambda row: [
-                        "background-color: #fef2f2;"
-                        if (row["Variance %"] if not pd.isna(row["Variance %"]) else 0) > 0.10
-                        else ""
-                        for _ in row
-                    ],
-                    axis=1,
-                )
-                .set_table_styles([
-                    {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
-                    {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
-                    {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
-                ])
+            styler = comparison.style.hide(axis="index")
+            styler = styler.format(
+                {"Planned": format_currency, "Actual": format_currency, "Variance": format_currency, "Variance %": format_percent},
+                na_rep="",
             )
+            styler = apply_cell_style_map(styler, negative_red, subset=["Variance"])
+            styler = styler.apply(
+                lambda row: [
+                    "background-color: #fef2f2;"
+                    if (row["Variance %"] if not pd.isna(row["Variance %"]) else 0) > 0.10
+                    else ""
+                    for _ in row
+                ],
+                axis=1,
+            )
+            styler = styler.set_table_styles([
+                {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
+                {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
+                {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
+            ])
             st.markdown(styler.to_html(), unsafe_allow_html=True)
             st.caption(f"Cash impact of variance: {format_currency(cash_impact)}")
 
