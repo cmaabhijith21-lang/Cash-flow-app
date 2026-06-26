@@ -2766,7 +2766,7 @@ def render_financial_table(
     styler = styler.set_properties(subset=["Line Item"], **{"text-align": "left", "white-space": "pre"})
     styler = styler.set_properties(subset=numeric_columns, **{"text-align": "right"})
     styler = styler.set_table_styles([
-        {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
+        {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "var(--font-size-table)")]},
         {"selector": "th", "props": [("text-align", "right"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
         {"selector": "th.col_heading.level0.col0", "props": [("text-align", "left")]},
         {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
@@ -2786,7 +2786,7 @@ def render_weekly_financial_table(
 
     week_columns = set(weekly_cashflow["week_columns"])
     week_header_map = {
-        week["key"]: f'{week["key"]}<br><span style="font-weight:400; font-size:0.82rem;">'
+        week["key"]: f'{week["key"]}<br><span style="font-weight:400; font-size:var(--font-size-small);">'
         f'{compact_day_date_label(week["start"])} - {compact_day_date_label(week["end"])}</span>'
         for week in weekly_cashflow["week_meta"]
     }
@@ -2797,7 +2797,7 @@ def render_weekly_financial_table(
 
     html_rows: list[str] = [
         '<div style="width:100%; overflow-x:auto;">',
-        '<table style="width:100%; border-collapse:collapse; font-size:0.95rem;">',
+        '<table style="width:100%; border-collapse:collapse; font-size:var(--font-size-table);">',
         "<thead><tr>",
     ]
     for idx, column in enumerate(header_columns):
@@ -2886,7 +2886,7 @@ def render_simple_table(
     if formatters:
         styler = styler.format(formatters, na_rep="")
     styler = styler.set_table_styles([
-        {"selector": "table", "props": [("width", "max-content"), ("min-width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.94rem")]},
+        {"selector": "table", "props": [("width", "max-content"), ("min-width", "100%"), ("border-collapse", "collapse"), ("font-size", "var(--font-size-table)")]},
         {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8"), ("vertical-align", "top"), ("white-space", "nowrap")]},
         {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1"), ("vertical-align", "top"), ("white-space", "normal"), ("word-break", "break-word")]},
     ])
@@ -2938,7 +2938,7 @@ def render_cash_alert_banner(
             f"""
             <div style="border:1px solid {border}; border-left:4px solid {text};
                         background:{bg}; color:{text}; padding:12px 16px;
-                        margin:8px 0; border-radius:4px; font-size:0.94rem; font-weight:600;">
+                        margin:8px 0; border-radius:4px; font-size:var(--font-size-body); font-weight:600;">
                 {message}
             </div>
             """,
@@ -3005,9 +3005,9 @@ def render_kpis(
         f"""
         <div style="border:1px solid #d4d4d8; border-left:4px solid #111827;
                     padding:16px 18px; margin-top:10px; margin-bottom:18px; background:#ffffff;">
-            <div style="font-size:1.0rem; font-weight:700; margin-bottom:8px;">Decision Box</div>
-            <div style="font-size:0.98rem; margin-bottom:10px;">{statement}</div>
-            <ul style="margin:0; padding-left:18px;">{bullets}</ul>
+            <div class="info-block-title">Decision Box</div>
+            <div class="info-block-body">{statement}</div>
+            <ul class="info-block-list" style="margin:0; padding-left:18px;">{bullets}</ul>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3128,7 +3128,7 @@ def render_six_month_view(
     styler = apply_cell_style_map(styler, negative_red, subset=["Closing Cash"])
     styler = styler.apply(style_closing_row, axis=1)
     styler = styler.set_table_styles([
-        {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
+        {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "var(--font-size-table)")]},
         {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
         {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
     ])
@@ -3141,7 +3141,7 @@ def render_six_month_view(
                 f"""
                 <div style="border:1px solid #fde68a; border-left:4px solid #92400e;
                             background:#fffbeb; color:#92400e; padding:10px 14px;
-                            margin:8px 0; border-radius:4px; font-size:0.9rem;">
+                            margin:8px 0; border-radius:4px; font-size:var(--font-size-small);">
                     <strong>Cash floor breach:</strong> {', '.join(breach_months)} — closing cash below minimum threshold of {format_currency(min_cash_threshold)}.
                 </div>
                 """,
@@ -3217,7 +3217,7 @@ def render_actual_vs_budget(
                 axis=1,
             )
             styler = styler.set_table_styles([
-                {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "0.95rem")]},
+                {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse"), ("font-size", "var(--font-size-table)")]},
                 {"selector": "th", "props": [("text-align", "left"), ("padding", "8px 10px"), ("border-bottom", "1px solid #d4d4d8")]},
                 {"selector": "td", "props": [("padding", "8px 10px"), ("border-bottom", "1px solid #ececf1")]},
             ])
@@ -3833,20 +3833,56 @@ def inject_styles() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: #f7f7f5; color: #111827; }
+        :root {
+            --font-size-title: 1.80rem;
+            --font-size-h2: 1.30rem;
+            --font-size-h3: 1.08rem;
+            --font-size-body: 0.95rem;
+            --font-size-small: 0.88rem;
+            --font-size-caption: 0.80rem;
+            --font-size-table: 0.93rem;
+            --font-size-metric-label: 0.82rem;
+            --font-size-metric-value: 1.45rem;
+        }
+        .stApp {
+            background: #f7f7f5;
+            color: #111827;
+            font-size: var(--font-size-body);
+            line-height: 1.55;
+        }
+        .stApp h1 { font-size: var(--font-size-title); letter-spacing: -0.02em; }
+        .stApp h2 { font-size: var(--font-size-h2); letter-spacing: -0.01em; }
+        .stApp h3, .stApp h4 { font-size: var(--font-size-h3); }
+        .stApp p, .stApp li, .stApp label, .stApp .stMarkdown, .stApp [data-testid="stCaptionContainer"] {
+            font-size: var(--font-size-body);
+        }
+        .stApp small, .stApp .stCaption, .stApp [data-testid="stCaptionContainer"] p {
+            font-size: var(--font-size-caption);
+        }
         .block-container { padding-top: 1.5rem; padding-bottom: 2.0rem; max-width: 1460px; }
         div[data-testid="metric-container"] {
             border: 1px solid #e5e7eb; padding: 12px 14px; border-radius: 6px;
             background: #ffffff; box-shadow: 0 1px 2px rgba(17,24,39,0.04);
         }
-        div[data-testid="metric-container"] label { font-size: 0.82rem; }
-        [data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #e5e7eb; }
+        div[data-testid="metric-container"] label { font-size: var(--font-size-metric-label); }
+        div[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: var(--font-size-metric-value); }
+        [data-testid="stSidebar"] {
+            background: #ffffff;
+            border-right: 1px solid #e5e7eb;
+            font-size: var(--font-size-small);
+        }
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] .stMarkdown,
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+            font-size: var(--font-size-small);
+        }
         .app-banner {
             background: #ffffff; border: 1px solid #e5e7eb;
             border-left: 4px solid #111827; padding: 18px 20px; margin-bottom: 18px;
         }
-        .app-banner-title { font-size: 1.05rem; font-weight: 700; margin-bottom: 6px; }
-        .app-banner-subtitle { font-size: 0.93rem; color: #4b5563; }
+        .app-banner-title { font-size: 1.08rem; font-weight: 700; margin-bottom: 6px; line-height: 1.35; }
+        .app-banner-subtitle { font-size: var(--font-size-body); color: #4b5563; line-height: 1.55; }
         .context-grid {
             display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 10px; margin-top: 14px;
@@ -3856,13 +3892,17 @@ def inject_styles() -> None:
             padding: 12px 14px; border-radius: 6px;
         }
         .context-label {
-            font-size: 0.75rem; color: #6b7280;
+            font-size: var(--font-size-caption); color: #6b7280;
             text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 3px;
         }
-        .context-value { font-size: 0.95rem; font-weight: 600; color: #111827; }
+        .context-value { font-size: var(--font-size-body); font-weight: 600; color: #111827; }
         .section-header { margin-top: 18px; margin-bottom: 12px; }
-        .section-title { font-size: 1.05rem; font-weight: 700; color: #111827; margin-bottom: 2px; }
-        .section-subtitle { font-size: 0.90rem; color: #6b7280; }
+        .section-title { font-size: 1.08rem; font-weight: 700; color: #111827; margin-bottom: 2px; line-height: 1.35; }
+        .section-subtitle { font-size: var(--font-size-small); color: #6b7280; line-height: 1.5; }
+        .supporting-note { font-size: var(--font-size-caption); color: #9ca3af; }
+        .info-block-title { font-size: 1.00rem; font-weight: 700; margin-bottom: 8px; line-height: 1.35; }
+        .info-block-body { font-size: var(--font-size-body); margin-bottom: 10px; line-height: 1.55; }
+        .info-block-list, .info-block-list li { font-size: var(--font-size-body); line-height: 1.55; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -3945,7 +3985,7 @@ def render_app_banner(
                     <div class="context-value">{floor_display}</div>
                 </div>
             </div>
-            <div style="margin-top:10px; font-size:0.78rem; color:#9ca3af;">
+            <div class="supporting-note" style="margin-top:10px;">
                 Workbook loaded: {load_ts_display}
             </div>
         </div>
@@ -3971,9 +4011,9 @@ def render_upload_prompt() -> None:
         <div class="app-banner">
             <div class="app-banner-title">Planned workbook required</div>
             <div class="app-banner-subtitle">The app runs only on the workbook uploaded for the day. You can add or remove outflow sheets as needed, as long as the key headers stay recognizable.</div>
-            <div style="margin-top:14px; font-size:0.94rem;">
+            <div style="margin-top:14px; font-size:var(--font-size-body);">
                 <strong>Expected format reference</strong>
-                <ul style="margin-top:8px;">{sheet_list}</ul>
+                <ul class="info-block-list" style="margin-top:8px;">{sheet_list}</ul>
             </div>
         </div>
         """,
